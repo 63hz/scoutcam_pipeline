@@ -1,0 +1,107 @@
+{
+    "_comment": "FRC Ball Tracker - Tunable Configuration. Edit directly or use 01_hsv_tuning.py to tune interactively.",
+    "video": {
+        "default_path": "kettering1.mkv",
+        "playback_speed": 1.0
+    },
+    "roi": {
+        "x": 4,
+        "y": 110,
+        "w": 1916,
+        "h": 787
+    },
+    "hsv_yellow": {
+        "_comment": "HSV range for yellow ball detection. TUNE THIS ON GAME DAY.",
+        "h_low": 23,
+        "h_high": 40,
+        "s_low": 132,
+        "s_high": 255,
+        "v_low": 133,
+        "v_high": 255
+    },
+    "morphology": {
+        "_comment": "Morphological operations to clean up the mask.",
+        "open_kernel": 3,
+        "close_kernel": 7,
+        "dilate_kernel": 3,
+        "dilate_iterations": 1
+    },
+    "contour_filter": {
+        "_comment": "Contour filtering for ball candidates.",
+        "min_area": 47,
+        "max_area": 407,
+        "min_circularity": 0.35,
+        "min_aspect_ratio": 0.5,
+        "max_aspect_ratio": 2.0
+    },
+    "watershed": {
+        "_comment": "DEPRECATED: Use cluster_splitting instead. Kept for fallback.",
+        "enabled": false,
+        "peak_ratio": 0.45,
+        "min_peak_distance": 8,
+        "area_multiplier": 1.8
+    },
+    "cluster_splitting": {
+        "_comment": "NMS-based cluster splitting for touching/overlapping balls. Preferred over watershed.",
+        "enabled": true,
+        "method": "nms",
+        "min_ball_radius": 5,
+        "peak_threshold": 0.57,
+        "area_multiplier": 1.47,
+        "max_cluster_area": 5000
+    },
+    "gpu": {
+        "_comment": "GPU acceleration via CuPy. Install: pip install cupy-cuda12x",
+        "enabled": true
+    },
+    "tracking": {
+        "_comment": "Multi-object centroid tracker parameters.",
+        "max_distance": 80,
+        "max_frames_missing": 8,
+        "trail_length": 30
+    },
+    "motion": {
+        "_comment": "Optional motion filtering to separate moving vs stationary balls.",
+        "use_motion_filter": false,
+        "bg_subtractor_history": 300,
+        "bg_subtractor_threshold": 50,
+        "min_motion_area": 30
+    },
+    "goal_regions": {
+        "_comment": "Define scoring zones. List of {name, x, y, w, h} rects. Set via 04_zones.py.",
+        "regions": []
+    },
+    "robot_zones": {
+        "_comment": "Robot identification zones or labels. Set via 04_zones.py.",
+        "robots": []
+    },
+    "shot_detection": {
+        "_comment": "Parameters for identifying shots (balls in upward/arcing flight).",
+        "min_upward_velocity": -3.0,
+        "min_speed": 5.0,
+        "proximity_to_robot": 120,
+        "min_flight_frames": 4
+    },
+    "output": {
+        "annotated_video_path": "output_annotated.mp4",
+        "csv_path": "shot_log.csv",
+        "codec": "mp4v",
+        "draw_trails": true,
+        "draw_ids": true,
+        "trail_color_scored": [
+            0,
+            255,
+            0
+        ],
+        "trail_color_missed": [
+            0,
+            0,
+            255
+        ],
+        "trail_color_unknown": [
+            0,
+            255,
+            255
+        ]
+    }
+}
