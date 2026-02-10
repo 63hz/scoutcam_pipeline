@@ -24,10 +24,12 @@ WORKFLOW:
     5. Run shot detection and review results
 
 CONTROLS:
-    g      - Define goal regions interactively
+    g      - Define goal regions (rectangles) interactively
+    G      - Define goal regions (polygons) interactively
     z      - Define robot zones interactively
     SPACE  - Play/Pause
-    n/p    - Step frames
+    n      - Step forward one frame
+    b      - Step backward one frame
     s      - Save zones + config
     q/ESC  - Quit
 
@@ -47,7 +49,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from frc_tracker_utils import (
     load_config, save_config, open_video, apply_roi,
     BallDetector, CentroidTracker, draw_hud, draw_zones,
-    point_in_rect
+    point_in_rect, point_in_polygon, draw_polygon,
+    RobotDetector, draw_robots
 )
 
 
@@ -70,10 +73,25 @@ class ShotDetector:
     3. Is near a robot zone at the time of launch
 
     The shot is then tracked to see if the ball enters a goal region.
+
+    OCCLUSION-SAFE ATTRIBUTION:
+        Shot attribution is locked at launch time and never re-evaluated.
+        This means if a ball passes through another robot's zone after launch,
+        it remains attributed to the original launching robot.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, robot_detector=None):
+        """
+        Initialize shot detector.
+
+        Args:
+            config: Configuration dict
+            robot_detector: Optional RobotDetector for dynamic robot tracking.
+                           If None, falls back to static robot zones from config.
+        """
         self.config = config
+        self.robot_detector = robot_detector
+
         shot_cfg = config.get("shot_detection", {})
         self.min_upward_vy = shot_cfg.get("min_upward_velocity", -3.0)
         self.min_speed = shot_cfg.get("min_speed", 5.0)
@@ -87,13 +105,24 @@ class ShotDetector:
         self.shots = []           # list of ShotEvent
         self.active_shots = {}    # obj_id -> ShotEvent (in-flight)
         self.ball_launch_candidates = {}  # obj_id -> frame count of upward motion
+        self.scored_ball_ids = set()  # obj_ids that have entered a goal (prevent bounce-out double-counting)
 
     def update(self, tracked_objects, frame_num):
         """
         Check all tracked objects for shot events.
         Call once per frame after tracker.update().
+
+        Returns:
+            list: Object IDs that should be removed from tracking (e.g., balls
+                  that entered goals). Caller should pass these to tracker.remove_objects().
         """
+        ids_to_remove = []
+
         for obj_id, obj in tracked_objects.items():
+            # Skip balls that have already scored (bounce-out prevention)
+            if obj_id in self.scored_ball_ids:
+                continue
+
             if obj.disappeared > 0:
                 # If this ball was being tracked as a shot and disappeared,
                 # it might have landed
@@ -111,8 +140,10 @@ class ShotDetector:
 
                 # Check if ball entered goal region
                 for goal in self.goal_regions:
-                    if point_in_rect(obj.cx, obj.cy, goal):
+                    if self._point_in_goal(obj.cx, obj.cy, goal):
                         shot.resolve("scored", frame_num, goal["name"])
+                        self.scored_ball_ids.add(obj_id)
+                        ids_to_remove.append(obj_id)
                         del self.active_shots[obj_id]
                         break
 
@@ -159,8 +190,37 @@ class ShotDetector:
                 if obj_id in self.ball_launch_candidates:
                     del self.ball_launch_candidates[obj_id]
 
+        return ids_to_remove
+
+    def _point_in_goal(self, px, py, goal):
+        """
+        Check if point is inside goal region.
+        Supports both polygon and rectangle formats for backwards compatibility.
+        """
+        # Check for polygon format first
+        if "polygon" in goal and goal["polygon"]:
+            return point_in_polygon(px, py, goal["polygon"])
+        # Fall back to rectangle format
+        return point_in_rect(px, py, goal)
+
     def _find_nearest_robot(self, obj):
-        """Find which robot zone the ball is closest to."""
+        """
+        Find which robot the ball is closest to at launch time.
+
+        Uses dynamic RobotDetector if available, otherwise falls back
+        to static robot zones from config.
+
+        Note: Attribution is locked at launch time (occlusion-safe).
+        """
+        # Try dynamic robot detection first
+        if self.robot_detector is not None:
+            robot_id = self.robot_detector.get_robot_at_position(
+                obj.cx, obj.cy, max_distance=self.proximity
+            )
+            if robot_id != "unknown":
+                return robot_id
+
+        # Fall back to static robot zones
         if not self.robot_zones:
             return "unknown"
 
@@ -222,7 +282,15 @@ class ShotDetector:
 
 
 class ShotEvent:
-    """A single shot event."""
+    """
+    A single shot event.
+
+    OCCLUSION-SAFE ATTRIBUTION:
+        The robot_name is captured at shot launch time and is never re-evaluated.
+        This ensures that if the ball passes through another robot's zone
+        after being launched, it remains correctly attributed to the robot
+        that actually made the shot.
+    """
 
     def __init__(self, shot_id, obj_id, launch_x, launch_y, launch_frame,
                  robot_name="unknown"):
@@ -288,6 +356,101 @@ def select_zones_on_frame(frame, zone_type="goal", existing=None):
 
         zones.append(zone)
         print(f"  Added: {zone}")
+
+    cv2.destroyWindow(win_name)
+    return zones
+
+
+def select_polygon_zone(frame, zone_type="goal", existing=None):
+    """
+    Interactive polygon selection for goal regions.
+    Click points to define vertices, press ENTER to finish, ESC to cancel.
+
+    Args:
+        frame: Frame to draw on
+        zone_type: Type of zone (for labeling)
+        existing: Existing polygon zones to display
+
+    Returns:
+        List of zone dicts with 'name' and 'polygon' keys
+    """
+    zones = list(existing or [])
+    win_name = f"Select {zone_type} polygon (click vertices, ENTER=finish, ESC=cancel, 'q'=done)"
+
+    while True:
+        points = []
+        display = frame.copy()
+
+        # Draw existing zones
+        for i, z in enumerate(zones):
+            if "polygon" in z and z["polygon"]:
+                display = draw_polygon(display, z["polygon"], (0, 255, 0), 2,
+                                        label=z.get("name", f"{zone_type}_{i}"))
+            elif "x" in z:  # Legacy rectangle format
+                cv2.rectangle(display, (z["x"], z["y"]),
+                              (z["x"]+z["w"], z["y"]+z["h"]), (0, 255, 0), 2)
+                cv2.putText(display, z.get("name", f"{zone_type}_{i}"),
+                            (z["x"]+5, z["y"]+20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        base_display = display.copy()
+
+        def mouse_callback(event, x, y, flags, param):
+            nonlocal points, display
+            if event == cv2.EVENT_LBUTTONDOWN:
+                points.append([x, y])
+                display = base_display.copy()
+
+                # Draw current polygon progress
+                for i, pt in enumerate(points):
+                    cv2.circle(display, tuple(pt), 5, (0, 255, 255), -1)
+                    if i > 0:
+                        cv2.line(display, tuple(points[i-1]), tuple(pt), (0, 255, 255), 2)
+
+                # Show closing line if we have enough points
+                if len(points) > 2:
+                    cv2.line(display, tuple(points[-1]), tuple(points[0]), (0, 255, 255), 1)
+
+            elif event == cv2.EVENT_MOUSEMOVE and len(points) > 0:
+                # Preview line to cursor
+                preview = display.copy()
+                cv2.line(preview, tuple(points[-1]), (x, y), (128, 128, 255), 1)
+                if len(points) > 1:
+                    cv2.line(preview, (x, y), tuple(points[0]), (128, 128, 255), 1)
+                cv2.imshow(win_name, preview)
+                return
+
+        cv2.namedWindow(win_name)
+        cv2.setMouseCallback(win_name, mouse_callback)
+
+        print(f"\n  Click points to define {zone_type} polygon.")
+        print("  ENTER = finish current polygon, ESC = cancel, 'q' = done adding zones")
+
+        while True:
+            cv2.imshow(win_name, display)
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == 13 and len(points) >= 3:  # ENTER - finish polygon
+                name = input(f"  Name for this {zone_type} zone "
+                             f"(or ENTER for '{zone_type}_{len(zones)}'): ").strip()
+                if not name:
+                    name = f"{zone_type}_{len(zones)}"
+
+                zone = {
+                    "name": name,
+                    "polygon": points,
+                }
+                zones.append(zone)
+                print(f"  Added polygon: {name} with {len(points)} vertices")
+                break
+
+            elif key == 27:  # ESC - cancel current polygon
+                print("  Cancelled current polygon")
+                break
+
+            elif key == ord('q'):  # Done adding zones
+                cv2.destroyWindow(win_name)
+                return zones
 
     cv2.destroyWindow(win_name)
     return zones
@@ -375,7 +538,14 @@ def main():
         trail_length=track_cfg["trail_length"],
     )
 
-    shot_detector = ShotDetector(config)
+    # Optional: dynamic robot tracking
+    robot_detector = None
+    robot_cfg = config.get("robot_detection", {})
+    if robot_cfg.get("enabled", False):
+        robot_detector = RobotDetector(config)
+        print("[ROBOTS] Dynamic robot tracking enabled")
+
+    shot_detector = ShotDetector(config, robot_detector=robot_detector)
 
     # --- Initial zone setup ---
     print("\n[ZONES] Set up goal regions and robot zones.")
@@ -403,7 +573,7 @@ def main():
             config["robot_zones"]["robots"] = robots
 
             save_config(config)
-            shot_detector = ShotDetector(config)  # Re-init with new zones
+            shot_detector = ShotDetector(config, robot_detector=robot_detector)  # Re-init with new zones
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
@@ -415,8 +585,8 @@ def main():
     playback_delay = int(1000 / vid_info["fps"])
     frame_num = 0
 
-    print("\nControls: SPACE=play/pause  g=goals  z=robots  s=save  "
-          "e=export CSV  q=quit\n")
+    print("\nControls: SPACE=play/pause  g=rect goals  G=poly goals  "
+          "z=robots  s=save  e=export CSV  q=quit\n")
 
     while True:
         if playing:
@@ -436,7 +606,7 @@ def main():
                 if not ret:
                     break
                 frame_num += 1
-            elif key == ord('p'):
+            elif key == ord('b'):
                 frame_num = max(0, frame_num - 2)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
                 ret, frame = cap.read()
@@ -450,7 +620,16 @@ def main():
                     config.get("goal_regions", {}).get("regions", [])
                 )
                 config["goal_regions"]["regions"] = goals
-                shot_detector = ShotDetector(config)
+                shot_detector = ShotDetector(config, robot_detector=robot_detector)
+                continue
+            elif key == ord('G'):
+                roi_frame = apply_roi(frame, config["roi"])
+                goals = select_polygon_zone(
+                    roi_frame, "goal",
+                    config.get("goal_regions", {}).get("regions", [])
+                )
+                config["goal_regions"]["regions"] = goals
+                shot_detector = ShotDetector(config, robot_detector=robot_detector)
                 continue
             elif key == ord('z'):
                 roi_frame = apply_roi(frame, config["roi"])
@@ -459,7 +638,7 @@ def main():
                     config.get("robot_zones", {}).get("robots", [])
                 )
                 config["robot_zones"]["robots"] = robots
-                shot_detector = ShotDetector(config)
+                shot_detector = ShotDetector(config, robot_detector=robot_detector)
                 continue
             elif key == ord('s'):
                 save_config(config)
@@ -474,10 +653,23 @@ def main():
         roi_frame = apply_roi(frame, config["roi"])
         detections = detector.detect(roi_frame)
         objects = tracker.update(detections)
-        shot_detector.update(objects, frame_num)
+
+        # Update robot tracking if enabled
+        if robot_detector is not None:
+            robot_detector.detect_and_track(roi_frame)
+
+        ids_to_remove = shot_detector.update(objects, frame_num)
+
+        # Remove balls that entered goals (prevents bounce-out double-counting)
+        if ids_to_remove:
+            tracker.remove_objects(ids_to_remove)
 
         # Draw
         display = draw_shots(roi_frame, shot_detector, objects, config)
+
+        # Draw detected robots if enabled
+        if robot_detector is not None:
+            display = draw_robots(display, robot_detector.get_all_robots())
 
         # HUD with shot stats
         shot_stats = shot_detector.get_stats()

@@ -16,6 +16,8 @@ frc_tracker_utils.py        # Core library (BallDetector, CentroidTracker, Track
 03_tracking_sandbox.py     # Multi-ball tracking visualization
 04_zones_and_shots.py      # Shot detection & robot attribution
 05_full_pipeline.py        # Production two-pass video processing
+06_robot_tuning.py         # Robot bumper HSV tuning
+07_yolo_poc.py             # [EXPERIMENTAL] YOLO ML detection POC
 ```
 
 ## Key Components
@@ -59,7 +61,8 @@ All parameters in `frc_tracker_config.json`. Key sections:
 - `contour_filter`: Shape/size filtering
 - `cluster_splitting`: NMS-based splitting for touching balls (enabled, min_ball_radius, peak_threshold, area_multiplier)
 - `watershed`: Legacy watershed splitting (deprecated, use cluster_splitting)
-- `tracking`: max_distance, max_frames_missing, trail_length
+- `tracking`: max_distance, max_frames_missing, trail_length (for ball tracking)
+- `robot_tracking`: tracker type (ocsort/centroid), max_age, min_hits, iou_threshold
 - `shot_detection`: velocity thresholds, proximity settings
 - `goal_regions` / `robot_zones`: Defined areas for attribution
 
@@ -97,13 +100,20 @@ All parameters in `frc_tracker_config.json`. Key sections:
 
 ## Known Limitations & Upgrade Paths
 
-| Current | Upgrade Path |
-|---------|--------------|
-| Greedy centroid matching | Hungarian algorithm (scipy.optimize.linear_sum_assignment) |
-| No occlusion handling | Kalman filtering for trajectory prediction |
-| HSV-only detection | YOLO/ML alternative for robustness |
-| Batch processing only | Live camera input support |
-| Single camera | Multi-camera triangulation |
+| Current | Status |
+|---------|--------|
+| Greedy centroid matching (balls) | Upgrade available: Hungarian algorithm for robots via OC-SORT |
+| No occlusion handling (balls) | Upgrade available: Kalman filtering for robots via OC-SORT |
+| HSV-only detection | YOLO/ML tested but requires custom training for FRC robots |
+| Batch processing only | Future: Live camera input support |
+| Single camera | Future: Multi-camera triangulation |
+
+**Robot Tracking Upgrades (Implemented):**
+- OC-SORT tracker with Kalman filter and Hungarian algorithm
+- IoU-based matching (better than centroid distance)
+- Observation-Centric Re-update (ORU) for trajectory smoothing
+- Observation-Centric Momentum (OCM) to prevent velocity drift
+- Configure via `robot_tracking.tracker` = "ocsort" or "centroid"
 
 ## Cluster Splitting Methods
 
@@ -116,18 +126,21 @@ All parameters in `frc_tracker_config.json`. Key sections:
 ## Dependencies
 
 **Required:** opencv-python, numpy
-**Optional:** matplotlib, pandas, cupy-cuda12x (GPU), scipy
+**Recommended:** scipy (for Hungarian algorithm in OC-SORT tracker)
+**Optional:** matplotlib, pandas, cupy-cuda12x (GPU), ultralytics (YOLO ML detection), easyocr (team number reading)
 
 ## File Reference
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| frc_tracker_utils.py | 826 | Core detection, tracking, drawing utilities |
+| frc_tracker_utils.py | ~2100 | Core detection, tracking, OC-SORT, RobotDetector, drawing utilities |
 | 01_hsv_tuning.py | 298 | HSV tuning with live trackbars |
 | 02_detection_test.py | 202 | Full-video detection statistics |
 | 03_tracking_sandbox.py | 326 | Tracking visualization and tuning |
-| 04_zones_and_shots.py | 533 | Shot detection, zones, attribution |
-| 05_full_pipeline.py | 302 | Two-pass production pipeline |
+| 04_zones_and_shots.py | ~700 | Shot detection, polygon zones, robot integration |
+| 05_full_pipeline.py | ~320 | Two-pass production pipeline |
+| 06_robot_tuning.py | ~350 | Robot bumper HSV tuning and ID correction |
+| 07_yolo_poc.py | ~350 | YOLO robot detection proof of concept |
 
 ## Debugging Tips
 
@@ -180,3 +193,153 @@ All parameters in `frc_tracker_config.json`. Key sections:
 **Known Issues:**
 - Very tightly packed clusters (balls significantly overlapping) may not split perfectly - distance transform peaks merge when overlap is too great
 - Possible future enhancement: expected-count mode that forces N peaks based on blob area
+
+### Session: 2026-02-10 - Pipeline Improvements (Polygons, Bounce-out, Robots)
+
+**Completed:**
+1. ✅ **Bounce-out handling**: Ball entering goal = 1 scored shot, prevents double-counting if ball bounces out
+   - Added `scored_ball_ids` set to ShotDetector
+   - `update()` now returns IDs to remove from tracker
+2. ✅ **Terminate tracking on goal entry**: Balls removed from tracker when they enter goals
+   - Added `remove_objects()` method to CentroidTracker
+3. ✅ **Polygon goal regions**: Full polygon support for irregularly-shaped goals
+   - Added `point_in_polygon()` and `draw_polygon()` utilities
+   - New interactive polygon selection UI (press 'G' in 04_zones_and_shots.py)
+   - Backwards compatible with rectangle format
+4. ✅ **Dynamic robot tracking**: Detect and track robots by bumper color
+   - New `RobotDetector` class with HSV-based bumper detection (red & blue)
+   - Multi-object tracking across frames
+   - Optional OCR for team number reading (requires easyocr)
+   - Manual correction support via click interface
+   - New `06_robot_tuning.py` script for HSV tuning
+5. ✅ **Occlusion-safe attribution**: Shot attribution locked at launch time (was already correct)
+   - Added documentation comments to ShotDetector and ShotEvent classes
+   - RobotDetector integration for dynamic robot lookup
+
+**New Controls in 04_zones_and_shots.py:**
+- `G` - Define polygon goal regions (click vertices, ENTER to finish)
+- `g` - Define rectangle goal regions (legacy)
+- `n` - Step forward one frame
+- `b` - Step backward one frame
+
+**New Script: 06_robot_tuning.py:**
+- Separate trackbar window (like 01_hsv_tuning.py)
+- Interactive HSV tuning for robot bumper detection
+- Toggle red/blue bumper display (r/u keys)
+- Debug view showing color masks (press 'd')
+- Click-to-correct mode for manual team number assignment (session-only)
+- Comprehensive inline help (press 'h' or '?')
+
+**New Config Section:**
+- `robot_detection`: HSV ranges for red/blue bumpers, contour filters, tracking params
+
+**Important Design Decisions:**
+- Team number corrections are SESSION-ONLY (not persisted to config)
+- Tracking IDs are ephemeral and cannot reliably persist across robot occlusions
+- Robots default to "unknown" until manually identified or OCR succeeds
+- `update_config()` now preserves tracking state (doesn't reset IDs)
+
+**Status:** All pipeline improvements complete. Ready for testing.
+
+### Session: 2026-02-10 - YOLO Migration POC
+
+**Context:**
+After evaluating the current HSV-based robot tracking approach, identified key limitations:
+- 15-25% GPU utilization (3090 underutilized)
+- Cannot recover robot IDs after occlusion
+- Bumper ROI doesn't capture full robot body for shot attribution
+
+**Decision:** Implement YOLO + modern tracker (BoT-SORT/ByteTrack) as alternative approach.
+
+**Created:**
+1. ✅ `07_yolo_poc.py` - Standalone proof of concept script
+   - YOLO detection with ultralytics library
+   - Toggle between no tracker, ByteTrack, or BoT-SORT
+   - HSV post-processing to classify alliance color from detections
+   - FPS benchmarking on 3090
+
+**New Script: 07_yolo_poc.py:**
+- Standalone POC - does NOT modify existing code
+- Tests YOLO detection quality on FRC footage
+- Controls: SPACE=pause, T=cycle tracker, C=confidence, D=debug, +/-=speed
+- Combines YOLO detection with HSV color classification for alliance
+
+**New Dependency (optional):**
+- `ultralytics`: ML-based object detection (~500MB with PyTorch)
+- Install: `pip install ultralytics`
+
+**Status:** POC created. Run `07_yolo_poc.py` to evaluate YOLO performance.
+
+**Next Steps:**
+1. Run POC to verify YOLO can detect robots in FRC footage
+2. Benchmark FPS (expect 100-150 FPS on 3090)
+3. Test BoT-SORT occlusion recovery
+4. If successful, create `ml_tracker_utils.py` for production integration
+
+### Session: 2026-02-10 - OC-SORT Robot Tracker Implementation
+
+**Context:**
+YOLO POC revealed pretrained COCO models don't recognize FRC robots. Training custom models requires labeled data. New direction: keep HSV bumper detection but upgrade tracker from simple centroid matching to OC-SORT style tracking.
+
+**Completed:**
+1. ✅ **KalmanBoxTracker class** (~100 lines)
+   - 8-state Kalman filter: [x, y, w, h, vx, vy, vw, vh]
+   - Constant velocity motion model
+   - OpenCV KalmanFilter for prediction/correction
+   - Stores recent observations for OC-SORT features
+
+2. ✅ **OCSORTTracker class** (~180 lines)
+   - Hungarian algorithm matching via `scipy.optimize.linear_sum_assignment`
+   - IoU-based cost matrix (better than centroid distance for boxes)
+   - Alliance constraint: only match same-color robots
+   - Observation-Centric Re-update (ORU): smooth trajectory after occlusion
+   - Observation-Centric Momentum (OCM): blend predicted/observed velocity
+   - Falls back to greedy matching if scipy unavailable
+
+3. ✅ **RobotDetector integration**
+   - Configurable tracker type: `"ocsort"` or `"centroid"`
+   - Seamless drop-in replacement via `_TrackerOutputWrapper`
+   - `get_tracker_stats()` for debugging/display
+   - Prints tracker type at initialization
+
+4. ✅ **Config section added**
+   ```json
+   "robot_tracking": {
+       "tracker": "ocsort",
+       "max_age": 15,
+       "min_hits": 3,
+       "iou_threshold": 0.3,
+       "use_oru": true,
+       "use_ocm": true
+   }
+   ```
+
+5. ✅ **06_robot_tuning.py updated**
+   - HUD shows tracker type and stats
+   - Displays active/confirmed tracks and match count for OC-SORT
+
+**Key Design Decisions:**
+- Kalman filter uses OpenCV's `cv2.KalmanFilter` (no new dependencies)
+- Hungarian algorithm requires scipy (~30MB, commonly installed)
+- Falls back to greedy matching if scipy unavailable
+- OC-SORT wrapper class ensures same interface as `TrackedRobot`
+- Config-driven tracker selection for easy A/B testing
+
+**New Dependencies:**
+- `scipy` (required for optimal Hungarian matching)
+- Install: `pip install scipy`
+
+**Files Modified:**
+| File | Change |
+|------|--------|
+| `frc_tracker_utils.py` | +KalmanBoxTracker, +OCSORTTracker, +iou(), +iou_distance(), +_TrackerOutputWrapper, modified RobotDetector |
+| `frc_tracker_config.json` | +robot_tracking config section |
+| `06_robot_tuning.py` | +tracker stats in HUD |
+
+**Status:** OC-SORT implementation complete. Ready for testing.
+
+**Next Steps:**
+1. Run `06_robot_tuning.py` with new tracker
+2. Test robot ID persistence through collisions
+3. Compare before/after on same video clips
+4. Tune `max_age` and `iou_threshold` for FRC scenarios

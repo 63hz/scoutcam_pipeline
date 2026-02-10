@@ -26,6 +26,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# Optional scipy for Hungarian algorithm (OC-SORT tracker)
+_SCIPY_AVAILABLE = False
+try:
+    from scipy.optimize import linear_sum_assignment
+    _SCIPY_AVAILABLE = True
+except ImportError:
+    pass
+
 # ============================================================================
 # GPU DETECTION (runs at import time)
 # ============================================================================
@@ -910,6 +918,20 @@ class CentroidTracker:
     def _deregister(self, obj_id):
         del self.objects[obj_id]
 
+    def remove_objects(self, obj_ids):
+        """
+        Remove specific objects from tracking.
+
+        Use this when balls enter goals or should otherwise be removed from
+        active tracking (e.g., to prevent bounce-out balls from being double-counted).
+
+        Args:
+            obj_ids: Iterable of object IDs to remove
+        """
+        for oid in obj_ids:
+            if oid in self.objects:
+                del self.objects[oid]
+
     def update(self, detections):
         """Update tracker with new frame detections."""
         if len(detections) == 0:
@@ -1003,6 +1025,1092 @@ class TrackedObject:
 
 
 # ============================================================================
+# ROBOT DETECTOR (Dynamic Robot Tracking)
+# ============================================================================
+
+# Optional OCR dependency
+_EASYOCR_AVAILABLE = False
+_ocr_reader = None
+
+try:
+    import easyocr
+    _EASYOCR_AVAILABLE = True
+except ImportError:
+    pass
+
+
+class TrackedRobot:
+    """
+    A tracked robot with position, identity, and alliance info.
+
+    Attributes:
+        id: Unique tracking ID
+        cx, cy: Current centroid position
+        bbox: Bounding box (x, y, w, h)
+        alliance: 'red' or 'blue'
+        team_number: Team number (e.g., '2491') or None if unknown
+        identity: Full identity string like 'red_2491' or 'blue_unknown'
+        ocr_attempted: Whether OCR has been attempted
+        manual_correction: Whether identity was manually corrected
+    """
+
+    def __init__(self, obj_id, detection, alliance):
+        self.id = obj_id
+        self.cx = detection["cx"]
+        self.cy = detection["cy"]
+        self.bbox = detection["bbox"]
+        self.area = detection["area"]
+        self.alliance = alliance
+        self.team_number = None
+        self.ocr_attempted = False
+        self.manual_correction = False
+        self.disappeared = 0
+        self.age = 0
+
+    @property
+    def identity(self):
+        """Return identity string like 'red_2491' or 'blue_unknown'."""
+        num = self.team_number if self.team_number else "unknown"
+        return f"{self.alliance}_{num}"
+
+    def update(self, detection):
+        """Update position from new detection."""
+        self.cx = detection["cx"]
+        self.cy = detection["cy"]
+        self.bbox = detection["bbox"]
+        self.area = detection["area"]
+        self.disappeared = 0
+        self.age += 1
+
+    def set_team_number(self, team_number, manual=False):
+        """Set team number (from OCR or manual correction)."""
+        self.team_number = str(team_number) if team_number else None
+        if manual:
+            self.manual_correction = True
+
+
+# ============================================================================
+# OC-SORT TRACKER (Kalman + Hungarian Algorithm)
+# ============================================================================
+
+class KalmanBoxTracker:
+    """
+    Kalman filter for tracking a single bounding box.
+
+    State vector: [x, y, w, h, vx, vy, vw, vh]
+        - (x, y): center of bounding box
+        - (w, h): width and height
+        - (vx, vy, vw, vh): velocities
+
+    This is a linear constant-velocity model. The Kalman filter predicts
+    where the object will be in the next frame and corrects based on
+    actual observations.
+    """
+    _count = 0  # Global ID counter
+
+    def __init__(self, bbox, alliance=None):
+        """
+        Initialize tracker with first detection.
+
+        Args:
+            bbox: (x, y, w, h) bounding box
+            alliance: 'red' or 'blue' for robot tracking
+        """
+        # 8 state dimensions, 4 measurement dimensions
+        self.kf = cv2.KalmanFilter(8, 4)
+
+        # Transition matrix (constant velocity model)
+        # State: [x, y, w, h, vx, vy, vw, vh]
+        # x_new = x + vx, y_new = y + vy, etc.
+        self.kf.transitionMatrix = np.array([
+            [1, 0, 0, 0, 1, 0, 0, 0],
+            [0, 1, 0, 0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0, 0, 1, 0],
+            [0, 0, 0, 1, 0, 0, 0, 1],
+            [0, 0, 0, 0, 1, 0, 0, 0],
+            [0, 0, 0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 0, 0, 1],
+        ], dtype=np.float32)
+
+        # Measurement matrix (we observe x, y, w, h)
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0, 0, 0],
+        ], dtype=np.float32)
+
+        # Process noise covariance (tuned for robot motion)
+        self.kf.processNoiseCov = np.eye(8, dtype=np.float32) * 0.1
+        self.kf.processNoiseCov[4:, 4:] *= 0.01  # Lower noise for velocities
+
+        # Measurement noise covariance
+        self.kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * 1.0
+
+        # Initial state covariance (high uncertainty)
+        self.kf.errorCovPost = np.eye(8, dtype=np.float32) * 10.0
+        self.kf.errorCovPost[4:, 4:] *= 100.0  # Very uncertain about initial velocity
+
+        # Initialize state with first observation
+        x, y, w, h = bbox
+        cx, cy = x + w / 2, y + h / 2
+        self.kf.statePost = np.array([cx, cy, w, h, 0, 0, 0, 0], dtype=np.float32)
+
+        # Tracking metadata
+        self.id = KalmanBoxTracker._count
+        KalmanBoxTracker._count += 1
+        self.alliance = alliance
+        self.team_number = None
+        self.manual_correction = False
+        self.hits = 1  # Total observations
+        self.age = 0  # Frames since creation
+        self.time_since_update = 0  # Frames since last observation
+
+        # OC-SORT: store recent observations for ORU
+        self.observations = deque(maxlen=10)
+        self.observations.append(bbox)
+        self.last_observation = bbox
+
+        # Velocity from last observation (for OCM)
+        self.observed_velocity = np.array([0.0, 0.0], dtype=np.float32)
+
+    def predict(self):
+        """
+        Advance state by one frame using Kalman prediction.
+
+        Returns:
+            Predicted bounding box (x, y, w, h)
+        """
+        # OC-SORT: Observation-Centric Momentum (OCM)
+        # Blend predicted velocity with last observed velocity
+        if self.time_since_update > 0:
+            alpha = 0.5  # Momentum weight
+            state = self.kf.statePost.flatten()
+            # Use weighted average of predicted and observed velocity
+            state[4] = alpha * self.observed_velocity[0] + (1 - alpha) * state[4]
+            state[5] = alpha * self.observed_velocity[1] + (1 - alpha) * state[5]
+            self.kf.statePost = state.reshape(-1, 1)
+
+        state = self.kf.predict().flatten()
+        self.age += 1
+        self.time_since_update += 1
+        return self._state_to_bbox(state)
+
+    def update(self, bbox):
+        """
+        Correct state with new observation.
+
+        Args:
+            bbox: Observed bounding box (x, y, w, h)
+        """
+        x, y, w, h = bbox
+        cx, cy = x + w / 2, y + h / 2
+        measurement = np.array([[cx], [cy], [w], [h]], dtype=np.float32)
+
+        # Compute observed velocity before update
+        if self.last_observation is not None:
+            old_x, old_y, old_w, old_h = self.last_observation
+            old_cx, old_cy = old_x + old_w / 2, old_y + old_h / 2
+            self.observed_velocity = np.array([cx - old_cx, cy - old_cy], dtype=np.float32)
+
+        # OC-SORT: Observation-Centric Re-update (ORU)
+        # If recovering from occlusion, re-update with virtual observations
+        if self.time_since_update > 1:
+            self._apply_oru(bbox)
+
+        self.kf.correct(measurement)
+        self.hits += 1
+        self.time_since_update = 0
+        self.observations.append(bbox)
+        self.last_observation = bbox
+
+    def _apply_oru(self, current_bbox):
+        """
+        Observation-Centric Re-update: Smooth trajectory after occlusion.
+
+        Creates virtual observations between last observation and current,
+        then re-runs Kalman updates to get a smoother trajectory estimate.
+        """
+        if len(self.observations) == 0 or self.time_since_update <= 1:
+            return
+
+        # Get last real observation
+        last = self.observations[-1]
+        x1, y1, w1, h1 = last
+        x2, y2, w2, h2 = current_bbox
+
+        # Linearly interpolate virtual observations for missing frames
+        n_missing = self.time_since_update - 1
+        for i in range(1, n_missing + 1):
+            t = i / (n_missing + 1)
+            vx = x1 + t * (x2 - x1)
+            vy = y1 + t * (y2 - y1)
+            vw = w1 + t * (w2 - w1)
+            vh = h1 + t * (h2 - h1)
+
+            # Apply virtual measurement with higher noise
+            vcx, vcy = vx + vw / 2, vy + vh / 2
+            measurement = np.array([[vcx], [vcy], [vw], [vh]], dtype=np.float32)
+
+            # Temporarily increase measurement noise for virtual observations
+            old_noise = self.kf.measurementNoiseCov.copy()
+            self.kf.measurementNoiseCov *= 2.0
+            self.kf.correct(measurement)
+            self.kf.measurementNoiseCov = old_noise
+
+    def get_state(self):
+        """
+        Get current bounding box estimate.
+
+        Returns:
+            Bounding box (x, y, w, h)
+        """
+        state = self.kf.statePost.flatten()
+        return self._state_to_bbox(state)
+
+    def _state_to_bbox(self, state):
+        """Convert state vector to bounding box."""
+        cx, cy, w, h = state[0], state[1], state[2], state[3]
+        # Ensure non-negative dimensions
+        w = max(1, w)
+        h = max(1, h)
+        x = cx - w / 2
+        y = cy - h / 2
+        return (int(x), int(y), int(w), int(h))
+
+    @property
+    def identity(self):
+        """Return identity string like 'red_2491' or 'blue_unknown'."""
+        num = self.team_number if self.team_number else "unknown"
+        return f"{self.alliance}_{num}"
+
+    def set_team_number(self, team_number, manual=False):
+        """Set team number (from OCR or manual correction)."""
+        self.team_number = str(team_number) if team_number else None
+        if manual:
+            self.manual_correction = True
+
+
+def iou(bbox1, bbox2):
+    """
+    Calculate Intersection over Union between two bounding boxes.
+
+    Args:
+        bbox1, bbox2: Bounding boxes as (x, y, w, h)
+
+    Returns:
+        IoU value between 0 and 1
+    """
+    x1, y1, w1, h1 = bbox1
+    x2, y2, w2, h2 = bbox2
+
+    # Calculate intersection
+    xi1 = max(x1, x2)
+    yi1 = max(y1, y2)
+    xi2 = min(x1 + w1, x2 + w2)
+    yi2 = min(y1 + h1, y2 + h2)
+
+    inter_w = max(0, xi2 - xi1)
+    inter_h = max(0, yi2 - yi1)
+    inter_area = inter_w * inter_h
+
+    # Calculate union
+    area1 = w1 * h1
+    area2 = w2 * h2
+    union_area = area1 + area2 - inter_area
+
+    if union_area <= 0:
+        return 0.0
+
+    return inter_area / union_area
+
+
+def iou_distance(bboxes1, bboxes2):
+    """
+    Compute IoU distance matrix between two sets of bounding boxes.
+
+    Args:
+        bboxes1: List of (x, y, w, h) bounding boxes
+        bboxes2: List of (x, y, w, h) bounding boxes
+
+    Returns:
+        Distance matrix where dist[i,j] = 1 - IoU(bboxes1[i], bboxes2[j])
+    """
+    n, m = len(bboxes1), len(bboxes2)
+    dist = np.ones((n, m), dtype=np.float32)
+
+    for i, b1 in enumerate(bboxes1):
+        for j, b2 in enumerate(bboxes2):
+            dist[i, j] = 1.0 - iou(b1, b2)
+
+    return dist
+
+
+class OCSORTTracker:
+    """
+    OC-SORT multi-object tracker for robust robot tracking.
+
+    Features:
+        - Kalman filter for motion prediction through occlusions
+        - Hungarian algorithm for globally optimal matching
+        - Observation-Centric Re-update (ORU) for trajectory smoothing
+        - Observation-Centric Momentum (OCM) to prevent velocity drift
+        - IoU-based matching (better than centroid distance for boxes)
+
+    Usage:
+        tracker = OCSORTTracker(config)
+        robots = tracker.update(detections)
+    """
+
+    def __init__(self, config):
+        """
+        Initialize OC-SORT tracker.
+
+        Args:
+            config: Full config dict (reads robot_tracking section)
+        """
+        self.config = config
+        track_cfg = config.get("robot_tracking", {})
+
+        self.max_age = track_cfg.get("max_age", 15)
+        self.min_hits = track_cfg.get("min_hits", 3)
+        self.iou_threshold = track_cfg.get("iou_threshold", 0.3)
+
+        self.trackers = []  # List of KalmanBoxTracker
+        self.frame_count = 0
+
+        # Stats for debugging
+        self._stats = {
+            "matches": 0,
+            "unmatched_tracks": 0,
+            "unmatched_dets": 0,
+            "id_switches": 0,
+        }
+
+    def update_config(self, config):
+        """Update tracker parameters without resetting state."""
+        self.config = config
+        track_cfg = config.get("robot_tracking", {})
+        self.max_age = track_cfg.get("max_age", 15)
+        self.min_hits = track_cfg.get("min_hits", 3)
+        self.iou_threshold = track_cfg.get("iou_threshold", 0.3)
+
+    def update(self, detections):
+        """
+        Update tracker with new frame detections.
+
+        Args:
+            detections: List of detection dicts with 'bbox', 'alliance', etc.
+
+        Returns:
+            OrderedDict of track_id -> TrackedRobot-like objects
+        """
+        self.frame_count += 1
+
+        # Convert detections to bbox list
+        det_bboxes = [d["bbox"] for d in detections]
+        det_alliances = [d.get("alliance", "unknown") for d in detections]
+
+        # Predict new locations for all existing trackers
+        predicted_bboxes = []
+        for t in self.trackers:
+            pred = t.predict()
+            predicted_bboxes.append(pred)
+
+        # Handle empty cases
+        if len(detections) == 0:
+            # No detections - just return confirmed tracks
+            self._cleanup_dead_tracks()
+            return self._get_output()
+
+        if len(self.trackers) == 0:
+            # No existing tracks - create new ones
+            for i, det in enumerate(detections):
+                self._create_tracker(det)
+            return self._get_output()
+
+        # Build IoU distance matrix
+        cost_matrix = iou_distance(predicted_bboxes, det_bboxes)
+
+        # Apply alliance constraint: set high cost for mismatched alliances
+        for i, t in enumerate(self.trackers):
+            for j, det_alliance in enumerate(det_alliances):
+                if t.alliance != det_alliance:
+                    cost_matrix[i, j] = 1.0  # Max distance = no match possible
+
+        # Hungarian matching
+        if _SCIPY_AVAILABLE:
+            row_indices, col_indices = linear_sum_assignment(cost_matrix)
+        else:
+            # Fallback to greedy matching if scipy not available
+            row_indices, col_indices = self._greedy_matching(cost_matrix)
+
+        # Process matches
+        matched_tracks = set()
+        matched_dets = set()
+
+        for r, c in zip(row_indices, col_indices):
+            if cost_matrix[r, c] > (1.0 - self.iou_threshold):
+                # IoU too low - not a valid match
+                continue
+            self.trackers[r].update(det_bboxes[c])
+            matched_tracks.add(r)
+            matched_dets.add(c)
+            self._stats["matches"] += 1
+
+        # Handle unmatched tracks (went missing)
+        for i in range(len(self.trackers)):
+            if i not in matched_tracks:
+                self._stats["unmatched_tracks"] += 1
+                # Track already predicted, just increment time_since_update (done in predict)
+
+        # Handle unmatched detections (new objects)
+        for j in range(len(detections)):
+            if j not in matched_dets:
+                self._create_tracker(detections[j])
+                self._stats["unmatched_dets"] += 1
+
+        # Remove dead tracks
+        self._cleanup_dead_tracks()
+
+        return self._get_output()
+
+    def _greedy_matching(self, cost_matrix):
+        """Fallback greedy matching when scipy is not available."""
+        n, m = cost_matrix.shape
+        rows, cols = [], []
+        matched_r, matched_c = set(), set()
+
+        # Sort all pairs by cost
+        flat = np.argsort(cost_matrix, axis=None)
+        row_idx, col_idx = np.unravel_index(flat, cost_matrix.shape)
+
+        for r, c in zip(row_idx, col_idx):
+            if r in matched_r or c in matched_c:
+                continue
+            rows.append(r)
+            cols.append(c)
+            matched_r.add(r)
+            matched_c.add(c)
+
+        return rows, cols
+
+    def _create_tracker(self, detection):
+        """Create new Kalman tracker for detection."""
+        bbox = detection["bbox"]
+        alliance = detection.get("alliance", "unknown")
+        tracker = KalmanBoxTracker(bbox, alliance=alliance)
+        self.trackers.append(tracker)
+        return tracker
+
+    def _cleanup_dead_tracks(self):
+        """Remove tracks that have been missing too long."""
+        self.trackers = [
+            t for t in self.trackers
+            if t.time_since_update <= self.max_age
+        ]
+
+    def _get_output(self):
+        """
+        Convert internal tracker list to TrackedRobot-like output dict.
+
+        Only returns confirmed tracks (enough hits and recently updated).
+        """
+        output = OrderedDict()
+
+        for t in self.trackers:
+            # Only return confirmed tracks
+            if t.hits >= self.min_hits and t.time_since_update == 0:
+                # Create a TrackedRobot-like object
+                robot = _TrackerOutputWrapper(t)
+                output[t.id] = robot
+
+        return output
+
+    def get_tracker_by_id(self, track_id):
+        """Get tracker by ID for manual corrections."""
+        for t in self.trackers:
+            if t.id == track_id:
+                return t
+        return None
+
+    def apply_correction(self, track_id, team_number):
+        """Apply team number correction to a tracker."""
+        t = self.get_tracker_by_id(track_id)
+        if t:
+            t.set_team_number(team_number, manual=True)
+
+    def get_stats(self):
+        """Get tracking statistics for debugging."""
+        return {
+            "active_tracks": len(self.trackers),
+            "confirmed_tracks": sum(1 for t in self.trackers if t.hits >= self.min_hits),
+            "frame_count": self.frame_count,
+            **self._stats
+        }
+
+    def reset_stats(self):
+        """Reset statistics counters."""
+        self._stats = {
+            "matches": 0,
+            "unmatched_tracks": 0,
+            "unmatched_dets": 0,
+            "id_switches": 0,
+        }
+
+
+class _TrackerOutputWrapper:
+    """
+    Wrapper to make KalmanBoxTracker compatible with TrackedRobot interface.
+
+    This allows OCSORTTracker to be a drop-in replacement for the old
+    centroid-based robot tracking.
+    """
+
+    def __init__(self, tracker):
+        self._tracker = tracker
+
+    @property
+    def id(self):
+        return self._tracker.id
+
+    @property
+    def cx(self):
+        bbox = self._tracker.get_state()
+        return bbox[0] + bbox[2] / 2
+
+    @property
+    def cy(self):
+        bbox = self._tracker.get_state()
+        return bbox[1] + bbox[3] / 2
+
+    @property
+    def bbox(self):
+        return self._tracker.get_state()
+
+    @property
+    def area(self):
+        bbox = self._tracker.get_state()
+        return bbox[2] * bbox[3]
+
+    @property
+    def alliance(self):
+        return self._tracker.alliance
+
+    @property
+    def team_number(self):
+        return self._tracker.team_number
+
+    @property
+    def identity(self):
+        return self._tracker.identity
+
+    @property
+    def manual_correction(self):
+        return self._tracker.manual_correction
+
+    @property
+    def disappeared(self):
+        return self._tracker.time_since_update
+
+    @property
+    def age(self):
+        return self._tracker.age
+
+
+class RobotDetector:
+    """
+    Detects and tracks FRC robots by bumper color.
+
+    Features:
+        - HSV color detection for red and blue bumpers
+        - Multi-object tracking across frames
+        - Optional OCR for reading team numbers from bumpers
+        - Manual correction support
+        - Position-based robot lookup for shot attribution
+
+    Usage:
+        detector = RobotDetector(config)
+        robots = detector.detect_and_track(frame)
+        robot_id = detector.get_robot_at_position(x, y)
+    """
+
+    def __init__(self, config):
+        self.config = config
+        robot_cfg = config.get("robot_detection", {})
+
+        # Alliance to track
+        self.track_alliance = robot_cfg.get("track_alliance", "both")
+
+        # HSV ranges for bumper colors
+        hsv_red = robot_cfg.get("hsv_red", {})
+        self.hsv_red1_lower = np.array([
+            hsv_red.get("h_low1", 0),
+            hsv_red.get("s_low", 100),
+            hsv_red.get("v_low", 80)
+        ])
+        self.hsv_red1_upper = np.array([
+            hsv_red.get("h_high1", 10),
+            hsv_red.get("s_high", 255),
+            hsv_red.get("v_high", 255)
+        ])
+        self.hsv_red2_lower = np.array([
+            hsv_red.get("h_low2", 170),
+            hsv_red.get("s_low", 100),
+            hsv_red.get("v_low", 80)
+        ])
+        self.hsv_red2_upper = np.array([
+            hsv_red.get("h_high2", 180),
+            hsv_red.get("s_high", 255),
+            hsv_red.get("v_high", 255)
+        ])
+
+        hsv_blue = robot_cfg.get("hsv_blue", {})
+        self.hsv_blue_lower = np.array([
+            hsv_blue.get("h_low", 100),
+            hsv_blue.get("s_low", 100),
+            hsv_blue.get("v_low", 80)
+        ])
+        self.hsv_blue_upper = np.array([
+            hsv_blue.get("h_high", 130),
+            hsv_blue.get("s_high", 255),
+            hsv_blue.get("v_high", 255)
+        ])
+
+        # Contour filters for bumpers
+        self.min_area = robot_cfg.get("min_bumper_area", 500)
+        self.max_area = robot_cfg.get("max_bumper_area", 15000)
+        self.min_aspect = robot_cfg.get("min_aspect_ratio", 1.5)
+        self.max_aspect = robot_cfg.get("max_aspect_ratio", 8.0)
+
+        # OCR
+        self.ocr_enabled = robot_cfg.get("ocr_enabled", True) and _EASYOCR_AVAILABLE
+
+        # Determine tracker type from config
+        track_type_cfg = config.get("robot_tracking", {})
+        self.tracker_type = track_type_cfg.get("tracker", "centroid")
+
+        # Legacy centroid tracking config (for fallback)
+        track_cfg = robot_cfg.get("tracking", {})
+        self.max_distance = track_cfg.get("max_distance", 150)
+        self.max_disappeared = track_cfg.get("max_frames_missing", 15)
+
+        # Initialize appropriate tracker
+        if self.tracker_type == "ocsort":
+            self._ocsort = OCSORTTracker(config)
+            self.robots = OrderedDict()  # Will be updated by _ocsort
+            self.next_id = 0  # Not used with ocsort
+            print(f"[TRACKER] Using OC-SORT (Kalman + Hungarian)")
+        else:
+            self._ocsort = None
+            self.next_id = 0
+            self.robots = OrderedDict()  # id -> TrackedRobot
+            print(f"[TRACKER] Using centroid tracker (legacy)")
+
+        # Note: Corrections are session-only and not loaded from config.
+        # Team numbers should only be assigned via OCR or manual correction
+        # during the current session, as tracking IDs are ephemeral.
+
+        # Debug
+        self._debug_red_mask = None
+        self._debug_blue_mask = None
+
+    def update_config(self, config):
+        """
+        Update detection parameters from config WITHOUT resetting tracking state.
+
+        This preserves robot identities and tracking across parameter changes,
+        which is essential for interactive tuning.
+        """
+        self.config = config
+        robot_cfg = config.get("robot_detection", {})
+
+        # Alliance to track
+        self.track_alliance = robot_cfg.get("track_alliance", "both")
+
+        # HSV ranges for bumper colors
+        hsv_red = robot_cfg.get("hsv_red", {})
+        self.hsv_red1_lower = np.array([
+            hsv_red.get("h_low1", 0),
+            hsv_red.get("s_low", 100),
+            hsv_red.get("v_low", 80)
+        ])
+        self.hsv_red1_upper = np.array([
+            hsv_red.get("h_high1", 10),
+            hsv_red.get("s_high", 255),
+            hsv_red.get("v_high", 255)
+        ])
+        self.hsv_red2_lower = np.array([
+            hsv_red.get("h_low2", 170),
+            hsv_red.get("s_low", 100),
+            hsv_red.get("v_low", 80)
+        ])
+        self.hsv_red2_upper = np.array([
+            hsv_red.get("h_high2", 180),
+            hsv_red.get("s_high", 255),
+            hsv_red.get("v_high", 255)
+        ])
+
+        hsv_blue = robot_cfg.get("hsv_blue", {})
+        self.hsv_blue_lower = np.array([
+            hsv_blue.get("h_low", 100),
+            hsv_blue.get("s_low", 100),
+            hsv_blue.get("v_low", 80)
+        ])
+        self.hsv_blue_upper = np.array([
+            hsv_blue.get("h_high", 130),
+            hsv_blue.get("s_high", 255),
+            hsv_blue.get("v_high", 255)
+        ])
+
+        # Contour filters for bumpers
+        self.min_area = robot_cfg.get("min_bumper_area", 500)
+        self.max_area = robot_cfg.get("max_bumper_area", 15000)
+        self.min_aspect = robot_cfg.get("min_aspect_ratio", 1.5)
+        self.max_aspect = robot_cfg.get("max_aspect_ratio", 8.0)
+
+        # OCR
+        self.ocr_enabled = robot_cfg.get("ocr_enabled", True) and _EASYOCR_AVAILABLE
+
+        # Update OC-SORT tracker config if active
+        if self._ocsort is not None:
+            self._ocsort.update_config(config)
+
+        # Legacy centroid tracking params (but NOT the tracking state itself)
+        track_cfg = robot_cfg.get("tracking", {})
+        self.max_distance = track_cfg.get("max_distance", 150)
+        self.max_disappeared = track_cfg.get("max_frames_missing", 15)
+
+    def detect_bumpers(self, frame):
+        """
+        Detect bumpers in frame by color.
+
+        Returns:
+            list: Detection dicts with 'cx', 'cy', 'bbox', 'area', 'alliance'
+        """
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        detections = []
+
+        # Red bumpers (two HSV ranges since red wraps around 0/180)
+        if self.track_alliance in ("both", "red"):
+            mask1 = cv2.inRange(hsv, self.hsv_red1_lower, self.hsv_red1_upper)
+            mask2 = cv2.inRange(hsv, self.hsv_red2_lower, self.hsv_red2_upper)
+            red_mask = cv2.bitwise_or(mask1, mask2)
+
+            # Morphological cleanup
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
+            red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
+
+            self._debug_red_mask = red_mask
+            detections.extend(self._find_bumper_contours(red_mask, "red"))
+
+        # Blue bumpers
+        if self.track_alliance in ("both", "blue"):
+            blue_mask = cv2.inRange(hsv, self.hsv_blue_lower, self.hsv_blue_upper)
+
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, kernel)
+            blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, kernel)
+
+            self._debug_blue_mask = blue_mask
+            detections.extend(self._find_bumper_contours(blue_mask, "blue"))
+
+        return detections
+
+    def _find_bumper_contours(self, mask, alliance):
+        """Find bumper-shaped contours in mask."""
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+        detections = []
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < self.min_area or area > self.max_area:
+                continue
+
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect = w / h if h > 0 else 0
+
+            # Bumpers are typically wide and short
+            if aspect < self.min_aspect or aspect > self.max_aspect:
+                continue
+
+            # Get centroid
+            M = cv2.moments(cnt)
+            if M["m00"] == 0:
+                continue
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+
+            detections.append({
+                "cx": float(cx),
+                "cy": float(cy),
+                "bbox": (x, y, w, h),
+                "area": float(area),
+                "alliance": alliance,
+                "contour": cnt,
+            })
+
+        return detections
+
+    def track(self, detections):
+        """
+        Update tracking with new detections.
+
+        Uses OC-SORT (Kalman + Hungarian) if configured, otherwise
+        falls back to greedy centroid matching.
+        """
+        # Use OC-SORT tracker if available
+        if self._ocsort is not None:
+            self.robots = self._ocsort.update(detections)
+            return self.robots
+
+        # Legacy centroid-based tracking
+        if len(detections) == 0:
+            for rid in list(self.robots.keys()):
+                self.robots[rid].disappeared += 1
+                if self.robots[rid].disappeared > self.max_disappeared:
+                    del self.robots[rid]
+            return self.robots
+
+        if len(self.robots) == 0:
+            for det in detections:
+                self._register(det)
+            return self.robots
+
+        # Build distance matrix
+        robot_ids = list(self.robots.keys())
+        robot_xy = np.array([(self.robots[rid].cx, self.robots[rid].cy)
+                              for rid in robot_ids])
+        det_xy = np.array([(d["cx"], d["cy"]) for d in detections])
+
+        dist_mat = np.linalg.norm(
+            robot_xy[:, np.newaxis, :] - det_xy[np.newaxis, :, :], axis=2
+        )
+
+        # Greedy matching
+        matched_r, matched_d = set(), set()
+        flat = np.argsort(dist_mat, axis=None)
+        rows, cols = np.unravel_index(flat, dist_mat.shape)
+
+        for r, c in zip(rows, cols):
+            if r in matched_r or c in matched_d:
+                continue
+            if dist_mat[r, c] > self.max_distance:
+                break
+            # Only match same alliance
+            if self.robots[robot_ids[r]].alliance != detections[c]["alliance"]:
+                continue
+            self.robots[robot_ids[r]].update(detections[c])
+            matched_r.add(r)
+            matched_d.add(c)
+
+        # Handle disappeared
+        for r in range(len(robot_ids)):
+            if r not in matched_r:
+                rid = robot_ids[r]
+                self.robots[rid].disappeared += 1
+                if self.robots[rid].disappeared > self.max_disappeared:
+                    del self.robots[rid]
+
+        # Register new detections
+        for c in range(len(detections)):
+            if c not in matched_d:
+                self._register(detections[c])
+
+        return self.robots
+
+    def _register(self, detection):
+        """
+        Register a new robot.
+
+        New robots start with team_number=None ("unknown") until identified
+        via OCR or manual correction. We intentionally do NOT auto-apply
+        corrections because tracking IDs are ephemeral and can be reused
+        when robots leave and re-enter the frame.
+        """
+        robot = TrackedRobot(self.next_id, detection, detection["alliance"])
+        self.robots[self.next_id] = robot
+        self.next_id += 1
+        return robot
+
+    def detect_and_track(self, frame):
+        """
+        Detect bumpers and update tracking in one call.
+
+        Args:
+            frame: BGR image
+
+        Returns:
+            OrderedDict of robot_id -> TrackedRobot
+        """
+        detections = self.detect_bumpers(frame)
+        return self.track(detections)
+
+    def attempt_ocr(self, frame, robot):
+        """
+        Attempt to read team number from bumper using OCR.
+
+        Args:
+            frame: BGR image
+            robot: TrackedRobot to OCR
+
+        Returns:
+            str: Team number if found, None otherwise
+        """
+        if not self.ocr_enabled or robot.ocr_attempted or robot.manual_correction:
+            return None
+
+        global _ocr_reader
+        if _ocr_reader is None:
+            try:
+                _ocr_reader = easyocr.Reader(['en'], gpu=_GPU_AVAILABLE)
+            except Exception as e:
+                print(f"[OCR] Failed to initialize: {e}")
+                self.ocr_enabled = False
+                return None
+
+        robot.ocr_attempted = True
+
+        # Crop to bumper region with padding
+        x, y, w, h = robot.bbox
+        pad = 10
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(frame.shape[1], x + w + pad)
+        y2 = min(frame.shape[0], y + h + pad)
+        crop = frame[y1:y2, x1:x2]
+
+        if crop.size == 0:
+            return None
+
+        try:
+            results = _ocr_reader.readtext(crop, allowlist='0123456789')
+            for (bbox, text, confidence) in results:
+                # FRC team numbers are 1-5 digits
+                if text.isdigit() and 1 <= len(text) <= 5 and confidence > 0.5:
+                    robot.set_team_number(text)
+                    return text
+        except Exception as e:
+            print(f"[OCR] Error: {e}")
+
+        return None
+
+    def apply_correction(self, robot_id, team_number):
+        """
+        Manually correct a robot's team number (session-only).
+
+        This correction only applies to the current tracking session.
+        If the robot disappears and reappears, it will need to be
+        re-identified. This is intentional because tracking IDs are
+        ephemeral and cannot reliably persist across robot occlusions.
+
+        Args:
+            robot_id: Robot tracking ID
+            team_number: Correct team number
+        """
+        if self._ocsort is not None:
+            self._ocsort.apply_correction(robot_id, team_number)
+        elif robot_id in self.robots:
+            self.robots[robot_id].set_team_number(team_number, manual=True)
+
+    def get_tracker_stats(self):
+        """
+        Get tracking statistics for debugging/display.
+
+        Returns:
+            dict with tracker type, active tracks, stats, etc.
+        """
+        if self._ocsort is not None:
+            stats = self._ocsort.get_stats()
+            stats["tracker_type"] = "ocsort"
+            return stats
+        else:
+            visible = sum(1 for r in self.robots.values() if r.disappeared == 0)
+            return {
+                "tracker_type": "centroid",
+                "active_tracks": len(self.robots),
+                "confirmed_tracks": visible,
+                "frame_count": 0,
+            }
+
+    def get_robot_at_position(self, x, y, max_distance=None):
+        """
+        Find the robot nearest to a position.
+
+        Args:
+            x, y: Position to search from
+            max_distance: Maximum distance to consider (default: self.max_distance)
+
+        Returns:
+            str: Robot identity (e.g., 'red_2491') or 'unknown' if none found
+        """
+        if max_distance is None:
+            max_distance = self.max_distance
+
+        min_dist = float("inf")
+        nearest = None
+
+        for robot in self.robots.values():
+            if robot.disappeared > 0:
+                continue
+            dist = math.sqrt((x - robot.cx)**2 + (y - robot.cy)**2)
+            if dist < min_dist and dist < max_distance:
+                min_dist = dist
+                nearest = robot
+
+        return nearest.identity if nearest else "unknown"
+
+    def get_all_robots(self):
+        """Get all currently visible robots."""
+        return {rid: r for rid, r in self.robots.items() if r.disappeared == 0}
+
+
+def draw_robots(frame, robots, show_ids=True, show_bbox=True):
+    """
+    Draw tracked robots on frame.
+
+    Args:
+        frame: BGR image
+        robots: Dict of robot_id -> TrackedRobot
+        show_ids: Show identity labels
+        show_bbox: Show bounding boxes
+
+    Returns:
+        Annotated frame
+    """
+    out = frame.copy()
+
+    for rid, robot in robots.items():
+        if robot.disappeared > 0:
+            continue
+
+        # Color based on alliance
+        color = (0, 0, 255) if robot.alliance == "red" else (255, 0, 0)
+
+        # Bounding box
+        if show_bbox:
+            x, y, w, h = robot.bbox
+            cv2.rectangle(out, (x, y), (x+w, y+h), color, 2)
+
+        # Centroid
+        cx, cy = int(robot.cx), int(robot.cy)
+        cv2.circle(out, (cx, cy), 5, color, -1)
+
+        # Label
+        if show_ids:
+            label = robot.identity
+            if robot.manual_correction:
+                label += " [M]"
+            cv2.putText(out, label, (cx + 10, cy - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    return out
+
+
+# ============================================================================
 # DRAWING HELPERS
 # ============================================================================
 
@@ -1056,13 +2164,25 @@ def draw_tracked_objects(frame, objects, config=None):
 
 
 def draw_zones(frame, config):
-    """Draw goal regions and robot zones."""
+    """Draw goal regions and robot zones. Supports both polygon and rectangle formats."""
     out = frame.copy()
+
+    # Draw goal regions
     for region in config.get("goal_regions", {}).get("regions", []):
-        x, y, w, h = region["x"], region["y"], region["w"], region["h"]
-        cv2.rectangle(out, (x, y), (x+w, y+h), (0, 255, 0), 2)
-        cv2.putText(out, region.get("name", "GOAL"), (x+5, y+20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        name = region.get("name", "GOAL")
+        color = (0, 255, 0)
+
+        # Check for polygon format first
+        if "polygon" in region and region["polygon"]:
+            out = draw_polygon(out, region["polygon"], color, 2, label=name)
+        elif "x" in region:
+            # Legacy rectangle format
+            x, y, w, h = region["x"], region["y"], region["w"], region["h"]
+            cv2.rectangle(out, (x, y), (x+w, y+h), color, 2)
+            cv2.putText(out, name, (x+5, y+20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    # Draw robot zones
     for robot in config.get("robot_zones", {}).get("robots", []):
         x, y, w, h = robot["x"], robot["y"], robot["w"], robot["h"]
         c = tuple(robot.get("color", [255, 165, 0]))
@@ -1154,6 +2274,67 @@ def create_debug_view(frame, mask, detections, detector=None):
 def point_in_rect(px, py, rect):
     return (rect["x"] <= px <= rect["x"] + rect["w"] and
             rect["y"] <= py <= rect["y"] + rect["h"])
+
+
+def point_in_polygon(px, py, polygon):
+    """
+    Check if point is inside polygon using ray casting algorithm.
+
+    Args:
+        px, py: Point coordinates
+        polygon: List of [x, y] vertex coordinates
+
+    Returns:
+        bool: True if point is inside polygon
+    """
+    n = len(polygon)
+    if n < 3:
+        return False
+
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def draw_polygon(frame, polygon, color, thickness=2, label=None, filled=False):
+    """
+    Draw polygon on frame with optional label.
+
+    Args:
+        frame: Image to draw on
+        polygon: List of [x, y] vertex coordinates
+        color: BGR color tuple
+        thickness: Line thickness (ignored if filled=True)
+        label: Optional text label to draw at polygon centroid
+        filled: If True, fill the polygon with semi-transparent color
+
+    Returns:
+        Frame with polygon drawn
+    """
+    out = frame.copy()
+    pts = np.array(polygon, np.int32).reshape((-1, 1, 2))
+
+    if filled:
+        overlay = out.copy()
+        cv2.fillPoly(overlay, [pts], color)
+        cv2.addWeighted(overlay, 0.3, out, 0.7, 0, out)
+        cv2.polylines(out, [pts], True, color, max(1, thickness // 2))
+    else:
+        cv2.polylines(out, [pts], True, color, thickness)
+
+    if label:
+        cx = int(np.mean([p[0] for p in polygon]))
+        cy = int(np.mean([p[1] for p in polygon]))
+        cv2.putText(out, label, (cx - len(label) * 4, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    return out
 
 
 def select_zones_interactive(video_path, zone_type="goal"):

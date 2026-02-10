@@ -38,7 +38,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from frc_tracker_utils import (
     load_config, open_video, apply_roi,
-    BallDetector, CentroidTracker, draw_hud, draw_zones
+    BallDetector, CentroidTracker, draw_hud, draw_zones,
+    RobotDetector, draw_robots
 )
 
 # Import ShotDetector from script 04
@@ -52,7 +53,7 @@ _spec.loader.exec_module(_mod)
 ShotDetector = _mod.ShotDetector
 
 
-VIDEO_PATH = ""  # <-- SET THIS
+VIDEO_PATH = "C:/Users/Clay/scoutcam_pipeline/kettering1.mkv"  # <-- SET THIS
 OUTPUT_PATH = ""  # Leave empty for auto-naming
 if not VIDEO_PATH and len(sys.argv) > 1:
     VIDEO_PATH = sys.argv[1]
@@ -89,7 +90,15 @@ def run_pipeline(video_path, output_path=None):
         max_distance=track_cfg["max_distance"],
         trail_length=track_cfg["trail_length"],
     )
-    shot_detector = ShotDetector(config)
+
+    # Optional: dynamic robot tracking
+    robot_detector = None
+    robot_cfg = config.get("robot_detection", {})
+    if robot_cfg.get("enabled", False):
+        robot_detector = RobotDetector(config)
+        print("  [ROBOTS] Dynamic robot tracking enabled")
+
+    shot_detector = ShotDetector(config, robot_detector=robot_detector)
 
     # Store per-frame data for pass 2
     frame_data = []  # list of {detections, object_states}
@@ -105,7 +114,16 @@ def run_pipeline(video_path, output_path=None):
         roi_frame = apply_roi(frame, config["roi"])
         detections = detector.detect(roi_frame)
         objects = tracker.update(detections)
-        shot_detector.update(objects, frame_num)
+
+        # Update robot tracking if enabled
+        if robot_detector is not None:
+            robot_detector.detect_and_track(roi_frame)
+
+        ids_to_remove = shot_detector.update(objects, frame_num)
+
+        # Remove balls that entered goals (prevents bounce-out double-counting)
+        if ids_to_remove:
+            tracker.remove_objects(ids_to_remove)
 
         # Save lightweight state for pass 2
         obj_states = {}
@@ -289,7 +307,7 @@ def run_pipeline(video_path, output_path=None):
 # ============================================================================
 
 if __name__ == "__main__":
-    global VIDEO_PATH, OUTPUT_PATH
+    VIDEO_PATH, OUTPUT_PATH
 
     if not VIDEO_PATH:
         VIDEO_PATH = input("Enter video file path: ").strip().strip('"').strip("'")
