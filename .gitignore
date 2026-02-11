@@ -28,6 +28,25 @@ build/
 # Output files
 output_*.mp4
 shot_log.csv
+*_annotated_shots.csv
+*_annotated.mp4
+
+# YOLO training datasets (large, download from Roboflow)
+robot-bumpers-3/
+bumpers1/
+bumpers2/
+bumpers-merged/
+*.zip
+
+# YOLO training runs and pretrained models
+runs/
+yolov8*.pt
+yolo*.pt
+!models/bumper_detector.pt
+
+# Temporary/debug files
+nul
+error_log.txt
 
 # OS
 .DS_Store

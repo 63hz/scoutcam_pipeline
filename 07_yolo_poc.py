@@ -2,21 +2,25 @@
 """
 07 - YOLO Robot Detection Proof of Concept
 ============================================
-Standalone test script to evaluate YOLO-based robot detection as an alternative
-to HSV bumper tracking. This does NOT modify existing code - it's purely for
-evaluation purposes.
+Test script to evaluate YOLO-based robot detection. Supports both pretrained
+COCO models and custom-trained bumper detection models.
 
 WHAT THIS TESTS:
     1. Can YOLO detect robots in FRC footage?
-    2. What classes does the pretrained COCO model see? (likely "person")
-    3. What FPS can we achieve on the 3090?
-    4. How well does the built-in tracker handle occlusions?
+    2. With custom model: direct red/blue bumper detection
+    3. With COCO model: HSV post-processing for alliance color
+    4. What FPS can we achieve on the 3090?
+    5. How well does the built-in tracker handle occlusions?
 
 REQUIREMENTS:
     pip install ultralytics
 
 USAGE:
-    python 07_yolo_poc.py [video_path]
+    python 07_yolo_poc.py [options] [video_path]
+
+OPTIONS:
+    --model PATH    Model to use (default: models/bumper_detector.pt if exists)
+    --expand N      Bbox expansion factor for robot body (default: 1.5)
 
 CONTROLS:
     Space   - Pause/Resume
@@ -24,6 +28,7 @@ CONTROLS:
     D       - Toggle debug info overlay
     T       - Cycle tracker types (None, ByteTrack, BoT-SORT)
     C       - Toggle confidence threshold (0.25, 0.5, 0.75)
+    E       - Toggle bbox expansion visualization
     +/-     - Adjust playback speed
 
 Author: Clay / Claude sandbox
@@ -32,8 +37,10 @@ Author: Clay / Claude sandbox
 import sys
 import os
 import time
+import argparse
 import cv2
 import numpy as np
+from pathlib import Path
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -74,43 +81,66 @@ except ImportError:
     sys.exit(1)
 
 
-# Classes from COCO that might be robots
-ROBOT_CLASSES = {
-    0: "person",      # Robots often detected as people
-    # Other potentially useful classes:
-    # 2: "car", 7: "truck" - unlikely but possible
-}
+# Paths
+SCRIPT_DIR = Path(__file__).parent
+DEFAULT_CUSTOM_MODEL = SCRIPT_DIR / "models" / "bumper_detector.pt"
+DEFAULT_COCO_MODEL = "yolov8s.pt"
+
+
+def get_default_model():
+    """Return custom model if exists, otherwise fall back to COCO model."""
+    if DEFAULT_CUSTOM_MODEL.exists():
+        return str(DEFAULT_CUSTOM_MODEL)
+    return DEFAULT_COCO_MODEL
 
 
 class YOLODetector:
     """YOLO-based detector for proof of concept."""
 
-    def __init__(self, model_name="yolov8n.pt", device="cuda"):
+    def __init__(self, model_path=None, device="cuda"):
         """
         Initialize YOLO detector.
 
         Args:
-            model_name: YOLO model to use. Options:
+            model_path: Path to YOLO model. If None, uses custom model if available.
+                Options for pretrained:
                 - yolov8n.pt (nano - fastest, ~6MB)
                 - yolov8s.pt (small - good balance, ~22MB)
                 - yolov8m.pt (medium - more accurate, ~52MB)
-                - yolov8l.pt (large - high accuracy, ~87MB)
-                - yolov8x.pt (extra large - highest accuracy, ~137MB)
+                Or custom trained:
+                - models/bumper_detector.pt (custom FRC bumper detection)
             device: "cuda" for GPU (required for benchmarking)
         """
-        print(f"\n  Loading YOLO model: {model_name}")
+        if model_path is None:
+            model_path = get_default_model()
+
+        print(f"\n  Loading YOLO model: {model_path}")
         print(f"  Device: {device}")
 
-        self.model = YOLO(model_name)
+        self.model = YOLO(model_path)
         self.device = device
         self.conf_threshold = 0.25
         self.tracker_type = None  # None, "bytetrack", "botsort"
+        self.model_path = model_path
+
+        # Check if this is a bumper detection model (has red/blue bumper classes)
+        self.is_bumper_model = self._check_bumper_model()
+        if self.is_bumper_model:
+            print(f"  Model type: Custom bumper detector")
+            print(f"  Classes: {list(self.model.names.values())}")
+        else:
+            print(f"  Model type: COCO pretrained (will use HSV for alliance)")
 
         # Warmup
         print("  Warming up model...")
         dummy = np.zeros((640, 640, 3), dtype=np.uint8)
         self.model.predict(dummy, device=device, verbose=False)
         print("  Model ready!\n")
+
+    def _check_bumper_model(self):
+        """Check if model has bumper-specific classes."""
+        class_names = [name.lower() for name in self.model.names.values()]
+        return any("bumper" in name for name in class_names)
 
     def detect(self, frame, use_tracker=False):
         """
@@ -175,6 +205,46 @@ class YOLODetector:
         if hasattr(self.model, 'predictor') and self.model.predictor:
             self.model.predictor.trackers = []
 
+    def get_alliance_from_class(self, class_name):
+        """
+        Determine alliance from class name (for bumper models).
+
+        Returns: "red", "blue", or "unknown"
+        """
+        name_lower = class_name.lower()
+        if "red" in name_lower:
+            return "red"
+        elif "blue" in name_lower:
+            return "blue"
+        return "unknown"
+
+
+def expand_bbox_upward(bbox, expansion_factor=1.5, frame_height=None):
+    """
+    Expand bumper bbox upward to approximate full robot body.
+
+    Bumpers are at the base of the robot. Shot attribution needs to consider
+    the full robot body above the bumpers. This expands the bbox upward.
+
+    Args:
+        bbox: (x1, y1, x2, y2) bounding box
+        expansion_factor: How much to expand upward (1.5 = add 150% of height above)
+        frame_height: Optional frame height to clamp y1 >= 0
+
+    Returns:
+        Expanded (x1, y1, x2, y2) bounding box
+    """
+    x1, y1, x2, y2 = bbox
+    height = y2 - y1
+    expanded_y1 = y1 - int(height * expansion_factor)
+
+    if frame_height is not None:
+        expanded_y1 = max(0, expanded_y1)
+    else:
+        expanded_y1 = max(0, expanded_y1)
+
+    return (x1, expanded_y1, x2, y2)
+
 
 def classify_alliance_by_hsv(frame, bbox, config):
     """
@@ -227,9 +297,11 @@ def classify_alliance_by_hsv(frame, bbox, config):
     return "unknown"
 
 
-def draw_detections(frame, detections, config, show_debug=True):
+def draw_detections(frame, detections, config, detector, show_debug=True,
+                    show_expanded=False, expansion_factor=1.5):
     """Draw detection boxes and labels on frame."""
     annotated = frame.copy()
+    frame_height = frame.shape[0]
 
     for det in detections:
         x1, y1, x2, y2 = det["bbox"]
@@ -237,8 +309,11 @@ def draw_detections(frame, detections, config, show_debug=True):
         conf = det["confidence"]
         track_id = det["track_id"]
 
-        # Determine alliance color
-        alliance = classify_alliance_by_hsv(frame, det["bbox"], config)
+        # Determine alliance color - use class name for bumper models, HSV otherwise
+        if detector.is_bumper_model:
+            alliance = detector.get_alliance_from_class(class_name)
+        else:
+            alliance = classify_alliance_by_hsv(frame, det["bbox"], config)
 
         # Color based on alliance
         if alliance == "red":
@@ -248,14 +323,28 @@ def draw_detections(frame, detections, config, show_debug=True):
         else:
             color = (128, 128, 128)  # Gray for unknown
 
-        # Draw bounding box
+        # Draw expanded bbox if enabled (dashed)
+        if show_expanded:
+            ex1, ey1, ex2, ey2 = expand_bbox_upward(
+                det["bbox"], expansion_factor, frame_height
+            )
+            # Draw dashed rectangle by drawing segments
+            for i in range(ex1, ex2, 10):
+                cv2.line(annotated, (i, ey1), (min(i + 5, ex2), ey1), color, 1)
+                cv2.line(annotated, (i, ey2), (min(i + 5, ex2), ey2), color, 1)
+            for i in range(ey1, ey2, 10):
+                cv2.line(annotated, (ex1, i), (ex1, min(i + 5, ey2)), color, 1)
+                cv2.line(annotated, (ex2, i), (ex2, min(i + 5, ey2)), color, 1)
+
+        # Draw bumper bounding box (solid)
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
 
         # Build label
         label_parts = [class_name]
         if track_id is not None:
             label_parts.insert(0, f"ID:{track_id}")
-        if alliance != "unknown":
+        if alliance != "unknown" and not detector.is_bumper_model:
+            # Only show alliance in label for COCO models (bumper models have it in class name)
             label_parts.append(alliance.upper())
         if show_debug:
             label_parts.append(f"{conf:.2f}")
@@ -274,9 +363,11 @@ def draw_stats(frame, stats):
     """Draw performance stats overlay."""
     lines = [
         f"FPS: {stats.get('fps', 0):.1f}",
+        f"Model: {stats.get('model_type', 'unknown')}",
         f"Detections: {stats.get('detections', 0)}",
         f"Tracker: {stats.get('tracker', 'None')}",
         f"Conf: {stats.get('confidence', 0.25):.2f}",
+        f"Expand: {stats.get('expand', 'OFF')}",
         f"Frame: {stats.get('frame_num', 0)}/{stats.get('total_frames', 0)}",
     ]
 
@@ -288,14 +379,14 @@ def draw_stats(frame, stats):
 
     # Instructions at bottom
     h = frame.shape[0]
-    instructions = "SPACE:Pause  Q:Quit  D:Debug  T:Tracker  C:Confidence  +/-:Speed"
+    instructions = "SPACE:Pause  Q:Quit  D:Debug  T:Tracker  C:Conf  E:Expand  +/-:Speed"
     cv2.putText(frame, instructions, (10, h - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
     return frame
 
 
-def run_poc(video_path):
+def run_poc(video_path, model_path=None, expansion_factor=1.5):
     """Run the YOLO proof of concept."""
     if not YOLO_AVAILABLE:
         return
@@ -312,14 +403,15 @@ def run_poc(video_path):
     print(f"  Frames: {vid_info['frame_count']}")
     print("=" * 60)
 
-    # Try different model sizes - start with small for balance
-    detector = YOLODetector(model_name="yolov8s.pt", device="cuda")
+    # Load specified model or default
+    detector = YOLODetector(model_path=model_path, device="cuda")
 
     cv2.namedWindow("YOLO POC", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("YOLO POC", 1280, 720)
 
     paused = False
     show_debug = True
+    show_expanded = False
     playback_speed = 1.0
     tracker_options = [None, "bytetrack", "botsort"]
     tracker_idx = 0
@@ -329,6 +421,9 @@ def run_poc(video_path):
     frame_num = 0
     total_frames = vid_info["frame_count"]
     fps_history = []
+
+    # Model type for display
+    model_type = "bumper" if detector.is_bumper_model else "COCO"
 
     print("\n  Press SPACE to start...")
     paused = True
@@ -360,13 +455,20 @@ def run_poc(video_path):
             # For POC, show all detections to see what YOLO finds
 
             # Draw
-            annotated = draw_detections(roi_frame, detections, config, show_debug)
+            annotated = draw_detections(
+                roi_frame, detections, config, detector,
+                show_debug=show_debug,
+                show_expanded=show_expanded,
+                expansion_factor=expansion_factor
+            )
 
             stats = {
                 "fps": avg_fps,
+                "model_type": model_type,
                 "detections": len(detections),
                 "tracker": tracker_options[tracker_idx] or "None",
                 "confidence": detector.conf_threshold,
+                "expand": f"{expansion_factor:.1f}x" if show_expanded else "OFF",
                 "frame_num": frame_num,
                 "total_frames": total_frames,
             }
@@ -414,6 +516,9 @@ def run_poc(video_path):
             conf_idx = (conf_idx + 1) % len(conf_options)
             detector.conf_threshold = conf_options[conf_idx]
             print(f"  Confidence threshold: {detector.conf_threshold}")
+        elif key == ord('e'):  # Expansion toggle
+            show_expanded = not show_expanded
+            print(f"  Bbox expansion: {'ON' if show_expanded else 'OFF'}")
         elif key == ord('+') or key == ord('='):
             playback_speed = min(4.0, playback_speed * 1.5)
             print(f"  Playback speed: {playback_speed:.1f}x")
@@ -439,13 +544,27 @@ def run_poc(video_path):
 # ============================================================================
 
 if __name__ == "__main__":
-    video_path = "C:/Users/Clay/scoutcam_pipeline/kettering1.mkv"
+    parser = argparse.ArgumentParser(
+        description="YOLO Robot Detection Proof of Concept"
+    )
+    parser.add_argument(
+        "video", nargs="?",
+        default="C:/Users/Clay/scoutcam_pipeline/kettering1.mkv",
+        help="Path to video file"
+    )
+    parser.add_argument(
+        "--model", type=str, default=None,
+        help="Path to YOLO model (default: models/bumper_detector.pt if exists)"
+    )
+    parser.add_argument(
+        "--expand", type=float, default=1.5,
+        help="Bbox expansion factor for robot body (default: 1.5)"
+    )
 
-    if len(sys.argv) > 1:
-        video_path = sys.argv[1]
+    args = parser.parse_args()
 
-    if not os.path.exists(video_path):
-        print(f"Video not found: {video_path}")
+    if not os.path.exists(args.video):
+        print(f"Video not found: {args.video}")
         sys.exit(1)
 
-    run_poc(video_path)
+    run_poc(args.video, model_path=args.model, expansion_factor=args.expand)

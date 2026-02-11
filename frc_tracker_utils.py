@@ -443,28 +443,26 @@ class BallDetector:
         if gpu_mask_2d is None:
             gpu_mask_2d = self._mask_gpu_fallback(gpu_bgr)
 
-        # --- Step 2: morphology on GPU ---
-        m = gpu_mask_2d > 0
+        # --- Step 2: transfer to CPU and do morphology with OpenCV ---
+        # OpenCV morphology is highly optimized and avoids CuPy kernel compilation
+        # issues with newer CUDA versions (12.9+)
+        mask = cp.asnumpy(gpu_mask_2d)
 
-        se_open = cp.asarray(
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                      (self._open_k, self._open_k)).astype(bool))
-        m = cp_ndimage.binary_opening(m, structure=se_open)
+        # Morphological operations on CPU (fast with OpenCV)
+        se_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                            (self._open_k, self._open_k))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, se_open)
 
-        se_close = cp.asarray(
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                      (self._close_k, self._close_k)).astype(bool))
-        m = cp_ndimage.binary_closing(m, structure=se_close)
+        se_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                             (self._close_k, self._close_k))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, se_close)
 
         if self.dilate_iters > 0:
-            se_dilate = cp.asarray(
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                          (self._dilate_k, self._dilate_k)).astype(bool))
-            m = cp_ndimage.binary_dilation(m, structure=se_dilate,
-                                            iterations=self.dilate_iters)
+            se_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                  (self._dilate_k, self._dilate_k))
+            mask = cv2.dilate(mask, se_dilate, iterations=self.dilate_iters)
 
-        # --- Step 3: download back to CPU ---
-        return cp.asnumpy(m.astype(cp.uint8)) * 255
+        return mask
 
     def _mask_gpu_fallback(self, gpu_bgr):
         """CuPy array-op HSV+threshold (no custom kernel)."""
@@ -2062,6 +2060,300 @@ class RobotDetector:
                 nearest = robot
 
         return nearest.identity if nearest else "unknown"
+
+    def get_all_robots(self):
+        """Get all currently visible robots."""
+        return {rid: r for rid, r in self.robots.items() if r.disappeared == 0}
+
+
+# ============================================================================
+# YOLO-BASED ROBOT DETECTOR
+# ============================================================================
+
+# Check for ultralytics availability
+_YOLO_AVAILABLE = False
+try:
+    from ultralytics import YOLO as _YOLO
+    _YOLO_AVAILABLE = True
+except ImportError:
+    pass
+
+
+class YOLORobotDetector:
+    """
+    Detects and tracks FRC robots using a YOLO model trained on bumper detection.
+
+    This is a drop-in replacement for RobotDetector that uses ML-based detection
+    instead of HSV color filtering. Requires a trained model from 08_train_bumper_model.py.
+
+    Features:
+        - YOLO-based bumper detection (more robust than HSV)
+        - Automatic alliance classification from class names
+        - Bounding box expansion for full robot body estimation
+        - Same tracker integration (OC-SORT or centroid)
+        - Same interface as RobotDetector
+
+    Usage:
+        detector = YOLORobotDetector(config)
+        robots = detector.detect_and_track(frame)
+        robot_id = detector.get_robot_at_position(x, y)
+    """
+
+    def __init__(self, config):
+        if not _YOLO_AVAILABLE:
+            raise ImportError(
+                "ultralytics not installed. Run: pip install ultralytics"
+            )
+
+        self.config = config
+        yolo_cfg = config.get("yolo_robot_detection", {})
+
+        # Load YOLO model
+        model_path = yolo_cfg.get("model_path", "models/bumper_detector.pt")
+        if not os.path.isabs(model_path):
+            # Make relative to script directory
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            model_path = os.path.join(script_dir, model_path)
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"YOLO model not found: {model_path}\n"
+                "Train a model with: python 08_train_bumper_model.py"
+            )
+
+        print(f"[YOLO] Loading model: {model_path}")
+        self.model = _YOLO(model_path)
+        self.conf_threshold = yolo_cfg.get("confidence_threshold", 0.5)
+        self.bbox_expansion = yolo_cfg.get("bbox_expansion_factor", 1.5)
+
+        # Check if model has bumper classes
+        self.class_names = self.model.names
+        print(f"[YOLO] Classes: {list(self.class_names.values())}")
+
+        # Determine tracker type from config
+        track_type_cfg = config.get("robot_tracking", {})
+        self.tracker_type = track_type_cfg.get("tracker", "centroid")
+
+        # Legacy tracking params (for centroid fallback)
+        self.max_distance = 150
+        self.max_disappeared = 15
+
+        # Initialize tracker
+        if self.tracker_type == "ocsort":
+            self._ocsort = OCSORTTracker(config)
+            self.robots = OrderedDict()
+            self.next_id = 0
+            print(f"[YOLO] Using OC-SORT tracker")
+        else:
+            self._ocsort = None
+            self.next_id = 0
+            self.robots = OrderedDict()
+            print(f"[YOLO] Using centroid tracker")
+
+        # Warmup model
+        print("[YOLO] Warming up model...")
+        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        self.model.predict(dummy, verbose=False)
+        print("[YOLO] Ready!")
+
+    def _get_alliance_from_class(self, class_id):
+        """Determine alliance from class name."""
+        class_name = self.class_names.get(class_id, "").lower()
+        if "red" in class_name:
+            return "red"
+        elif "blue" in class_name:
+            return "blue"
+        return "unknown"
+
+    def _expand_bbox_upward(self, bbox, frame_height):
+        """Expand bumper bbox upward to approximate full robot body."""
+        x1, y1, x2, y2 = bbox
+        height = y2 - y1
+        expanded_y1 = max(0, y1 - int(height * self.bbox_expansion))
+        return (x1, expanded_y1, x2, y2)
+
+    def detect_bumpers(self, frame):
+        """
+        Detect bumpers using YOLO.
+
+        Returns:
+            list: Detection dicts with 'cx', 'cy', 'bbox', 'area', 'alliance'
+        """
+        results = self.model.predict(
+            frame,
+            conf=self.conf_threshold,
+            verbose=False
+        )
+
+        detections = []
+        frame_height = frame.shape[0]
+
+        for result in results:
+            boxes = result.boxes
+            if boxes is None:
+                continue
+
+            for i in range(len(boxes)):
+                cls_id = int(boxes.cls[i])
+                conf = float(boxes.conf[i])
+                xyxy = boxes.xyxy[i].cpu().numpy()
+
+                x1, y1, x2, y2 = map(int, xyxy)
+                alliance = self._get_alliance_from_class(cls_id)
+
+                # Skip unknown alliance
+                if alliance == "unknown":
+                    continue
+
+                # Calculate center and dimensions
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+                w = x2 - x1
+                h = y2 - y1
+                area = w * h
+
+                # Store both bumper bbox and expanded robot bbox
+                bumper_bbox = (x1, y1, w, h)
+                robot_bbox = self._expand_bbox_upward((x1, y1, x2, y2), frame_height)
+
+                detections.append({
+                    "cx": cx,
+                    "cy": cy,
+                    "bbox": bumper_bbox,
+                    "robot_bbox": robot_bbox,
+                    "area": area,
+                    "alliance": alliance,
+                    "confidence": conf,
+                })
+
+        return detections
+
+    def track(self, detections):
+        """Update tracking with new detections."""
+        if self._ocsort is not None:
+            # Use OC-SORT tracker
+            self.robots = self._ocsort.update(detections)
+            return self.robots
+
+        # Legacy centroid tracking (same as RobotDetector)
+        if not self.robots:
+            for det in detections:
+                self._register(det)
+            return self.robots
+
+        # Build distance matrix
+        robot_ids = list(self.robots.keys())
+        robot_xy = np.array([(self.robots[rid].cx, self.robots[rid].cy)
+                              for rid in robot_ids])
+        det_xy = np.array([(d["cx"], d["cy"]) for d in detections])
+
+        if len(det_xy) == 0:
+            # No detections - increment disappeared for all
+            for rid in list(self.robots.keys()):
+                self.robots[rid].disappeared += 1
+                if self.robots[rid].disappeared > self.max_disappeared:
+                    del self.robots[rid]
+            return self.robots
+
+        dist_mat = np.linalg.norm(
+            robot_xy[:, np.newaxis, :] - det_xy[np.newaxis, :, :], axis=2
+        )
+
+        # Greedy matching
+        matched_r, matched_d = set(), set()
+        flat = np.argsort(dist_mat, axis=None)
+        rows, cols = np.unravel_index(flat, dist_mat.shape)
+
+        for r, c in zip(rows, cols):
+            if r in matched_r or c in matched_d:
+                continue
+            if dist_mat[r, c] > self.max_distance:
+                break
+            # Only match same alliance
+            if self.robots[robot_ids[r]].alliance != detections[c]["alliance"]:
+                continue
+            self.robots[robot_ids[r]].update(detections[c])
+            matched_r.add(r)
+            matched_d.add(c)
+
+        # Handle disappeared
+        for r in range(len(robot_ids)):
+            if r not in matched_r:
+                rid = robot_ids[r]
+                self.robots[rid].disappeared += 1
+                if self.robots[rid].disappeared > self.max_disappeared:
+                    del self.robots[rid]
+
+        # Register new detections
+        for c in range(len(detections)):
+            if c not in matched_d:
+                self._register(detections[c])
+
+        return self.robots
+
+    def _register(self, detection):
+        """Register a new robot."""
+        robot = TrackedRobot(self.next_id, detection, detection["alliance"])
+        self.robots[self.next_id] = robot
+        self.next_id += 1
+        return robot
+
+    def detect_and_track(self, frame):
+        """
+        Detect bumpers and update tracking in one call.
+
+        Args:
+            frame: BGR image
+
+        Returns:
+            OrderedDict of robot_id -> TrackedRobot
+        """
+        detections = self.detect_bumpers(frame)
+        return self.track(detections)
+
+    def get_robot_at_position(self, x, y, max_distance=None):
+        """
+        Find the robot nearest to a position.
+
+        Uses expanded robot bbox for better shot attribution.
+
+        Args:
+            x, y: Position to search from
+            max_distance: Maximum distance to consider
+
+        Returns:
+            str: Robot identity (e.g., 'red_2491') or 'unknown' if none found
+        """
+        if max_distance is None:
+            max_distance = self.max_distance
+
+        min_dist = float("inf")
+        nearest = None
+
+        for robot in self.robots.values():
+            if robot.disappeared > 0:
+                continue
+            dist = math.sqrt((x - robot.cx)**2 + (y - robot.cy)**2)
+            if dist < min_dist and dist < max_distance:
+                min_dist = dist
+                nearest = robot
+
+        return nearest.identity if nearest else "unknown"
+
+    def get_tracker_stats(self):
+        """Get tracking statistics for debugging/display."""
+        if self._ocsort is not None:
+            stats = self._ocsort.get_stats()
+            stats["tracker_type"] = "yolo+ocsort"
+            return stats
+        else:
+            visible = sum(1 for r in self.robots.values() if r.disappeared == 0)
+            return {
+                "tracker_type": "yolo+centroid",
+                "active_tracks": len(self.robots),
+                "confirmed_tracks": visible,
+                "frame_count": 0,
+            }
 
     def get_all_robots(self):
         """Get all currently visible robots."""

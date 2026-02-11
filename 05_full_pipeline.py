@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from frc_tracker_utils import (
     load_config, open_video, apply_roi,
     BallDetector, CentroidTracker, draw_hud, draw_zones,
-    RobotDetector, draw_robots
+    RobotDetector, YOLORobotDetector, draw_robots
 )
 
 # Import ShotDetector from script 04
@@ -91,12 +91,24 @@ def run_pipeline(video_path, output_path=None):
         trail_length=track_cfg["trail_length"],
     )
 
-    # Optional: dynamic robot tracking
+    # Optional: dynamic robot tracking (YOLO or HSV)
     robot_detector = None
-    robot_cfg = config.get("robot_detection", {})
-    if robot_cfg.get("enabled", False):
+    yolo_cfg = config.get("yolo_robot_detection", {})
+    hsv_cfg = config.get("robot_detection", {})
+
+    if yolo_cfg.get("enabled", False):
+        try:
+            robot_detector = YOLORobotDetector(config)
+            print("  [ROBOTS] YOLO-based robot tracking enabled")
+        except (ImportError, FileNotFoundError) as e:
+            print(f"  [ROBOTS] YOLO failed: {e}")
+            print("  [ROBOTS] Falling back to HSV detection...")
+            if hsv_cfg.get("enabled", False):
+                robot_detector = RobotDetector(config)
+                print("  [ROBOTS] HSV robot tracking enabled")
+    elif hsv_cfg.get("enabled", False):
         robot_detector = RobotDetector(config)
-        print("  [ROBOTS] Dynamic robot tracking enabled")
+        print("  [ROBOTS] HSV robot tracking enabled")
 
     shot_detector = ShotDetector(config, robot_detector=robot_detector)
 
@@ -138,9 +150,22 @@ def run_pipeline(video_path, output_path=None):
                     "speed": obj.speed,
                 }
 
+        # Save robot states if tracking enabled
+        robot_states = {}
+        if robot_detector is not None:
+            for rid, robot in robot_detector.robots.items():
+                if robot.disappeared == 0:
+                    robot_states[rid] = {
+                        "cx": robot.cx, "cy": robot.cy,
+                        "bbox": robot.bbox,
+                        "alliance": robot.alliance,
+                        "identity": robot.identity,
+                    }
+
         frame_data.append({
             "detections_count": len(detections),
             "object_states": obj_states,
+            "robot_states": robot_states,
         })
 
         frame_num += 1
@@ -203,6 +228,28 @@ def run_pipeline(video_path, output_path=None):
 
         # Draw zones
         annotated = draw_zones(roi_frame, config)
+
+        # Draw robots if tracking enabled
+        robot_states = fd.get("robot_states", {})
+        if robot_states:
+            for rid, rs in robot_states.items():
+                x, y, w, h = rs["bbox"]
+                alliance = rs["alliance"]
+                identity = rs["identity"]
+
+                # Color based on alliance
+                if alliance == "red":
+                    color = (0, 0, 255)
+                else:
+                    color = (255, 0, 0)
+
+                # Draw bounding box
+                cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
+
+                # Draw label
+                label = identity
+                cv2.putText(annotated, label, (x, y - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
         # Draw tracked objects with retroactive shot coloring
         for oid, state in fd["object_states"].items():
@@ -307,8 +354,6 @@ def run_pipeline(video_path, output_path=None):
 # ============================================================================
 
 if __name__ == "__main__":
-    VIDEO_PATH, OUTPUT_PATH
-
     if not VIDEO_PATH:
         VIDEO_PATH = input("Enter video file path: ").strip().strip('"').strip("'")
 

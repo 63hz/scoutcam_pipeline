@@ -69,7 +69,22 @@
     },
     "goal_regions": {
         "_comment": "Define scoring zones. Supports rectangles {name, x, y, w, h} or polygons {name, polygon: [[x,y],...]}. Use 'g' for rect, 'G' for polygon in 04_zones.py.",
-        "regions": []
+        "regions": [
+            {
+                "name": "red_hub",
+                "x": 1216,
+                "y": 228,
+                "w": 151,
+                "h": 80
+            },
+            {
+                "name": "blue_hub",
+                "x": 349,
+                "y": 232,
+                "w": 148,
+                "h": 81
+            }
+        ]
     },
     "robot_zones": {
         "_comment": "Robot identification zones or labels. Set via 04_zones.py.",
@@ -84,16 +99,16 @@
     },
     "robot_tracking": {
         "_comment": "OC-SORT tracker for robust robot tracking. Set tracker to 'ocsort' or 'centroid'.",
-        "tracker": "ocsort",
+        "tracker": "centroid",
         "max_age": 15,
         "min_hits": 3,
         "iou_threshold": 0.3,
-        "use_oru": true,
-        "use_ocm": true
+        "use_oru": false,
+        "use_ocm": false
     },
     "robot_detection": {
         "_comment": "Dynamic robot tracking by bumper color. Use 06_robot_tuning.py to tune HSV values.",
-        "enabled": true,
+        "enabled": false,
         "track_alliance": "both",
         "hsv_red": {
             "_comment": "Red HSV range (wraps around 0/180, so uses two ranges)",
@@ -123,6 +138,14 @@
             "max_distance": 150,
             "max_frames_missing": 15
         }
+    },
+    "yolo_robot_detection": {
+        "_comment": "YOLO-based robot detection using custom trained model. Use 08_train_bumper_model.py to train.",
+        "enabled": true,
+        "model_path": "models/bumper_detector.pt",
+        "confidence_threshold": 0.5,
+        "bbox_expansion_factor": 1.5,
+        "use_tracker": "ocsort"
     },
     "output": {
         "annotated_video_path": "output_annotated.mp4",

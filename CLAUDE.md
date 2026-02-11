@@ -9,7 +9,7 @@ Motion tracking system for FRC scouting that detects yellow foam balls, tracks t
 ```
 frc_tracker_config.json     # Single source of truth for all parameters
          ↓
-frc_tracker_utils.py        # Core library (BallDetector, CentroidTracker, TrackedObject)
+frc_tracker_utils.py        # Core library (BallDetector, CentroidTracker, TrackedObject, YOLORobotDetector)
          ↓
 01_hsv_tuning.py           # Interactive HSV/morphology parameter tuning
 02_detection_test.py       # Detection validation across full video
@@ -17,7 +17,8 @@ frc_tracker_utils.py        # Core library (BallDetector, CentroidTracker, Track
 04_zones_and_shots.py      # Shot detection & robot attribution
 05_full_pipeline.py        # Production two-pass video processing
 06_robot_tuning.py         # Robot bumper HSV tuning
-07_yolo_poc.py             # [EXPERIMENTAL] YOLO ML detection POC
+07_yolo_poc.py             # YOLO robot detection testing (supports custom models)
+08_train_bumper_model.py   # Train custom YOLO model for bumper detection
 ```
 
 ## Key Components
@@ -104,9 +105,17 @@ All parameters in `frc_tracker_config.json`. Key sections:
 |---------|--------|
 | Greedy centroid matching (balls) | Upgrade available: Hungarian algorithm for robots via OC-SORT |
 | No occlusion handling (balls) | Upgrade available: Kalman filtering for robots via OC-SORT |
-| HSV-only detection | YOLO/ML tested but requires custom training for FRC robots |
 | Batch processing only | Future: Live camera input support |
 | Single camera | Future: Multi-camera triangulation |
+
+**Robot Detection Options (Implemented):**
+- **YOLO-based** (recommended): Custom-trained model detects red/blue bumpers directly
+  - Train with `08_train_bumper_model.py` on labeled bumper datasets
+  - Configure via `yolo_robot_detection.enabled = true`
+  - Model stored in `models/bumper_detector.pt`
+- **HSV-based** (fallback): Color-based bumper detection
+  - Tune with `06_robot_tuning.py`
+  - Configure via `robot_detection.enabled = true`
 
 **Robot Tracking Upgrades (Implemented):**
 - OC-SORT tracker with Kalman filter and Hungarian algorithm
@@ -126,21 +135,28 @@ All parameters in `frc_tracker_config.json`. Key sections:
 ## Dependencies
 
 **Required:** opencv-python, numpy
-**Recommended:** scipy (for Hungarian algorithm in OC-SORT tracker)
-**Optional:** matplotlib, pandas, cupy-cuda12x (GPU), ultralytics (YOLO ML detection), easyocr (team number reading)
+**Recommended:** scipy (for Hungarian algorithm in OC-SORT tracker), ultralytics (YOLO robot detection)
+**Optional:** matplotlib, pandas, cupy-cuda12x (GPU acceleration for ball detection), easyocr (team number OCR)
+
+**Install for full functionality:**
+```bash
+pip install opencv-python numpy scipy ultralytics
+pip install cupy-cuda12x  # Optional: GPU-accelerated ball detection
+```
 
 ## File Reference
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| frc_tracker_utils.py | ~2100 | Core detection, tracking, OC-SORT, RobotDetector, drawing utilities |
-| 01_hsv_tuning.py | 298 | HSV tuning with live trackbars |
-| 02_detection_test.py | 202 | Full-video detection statistics |
-| 03_tracking_sandbox.py | 326 | Tracking visualization and tuning |
+| frc_tracker_utils.py | ~2600 | Core detection, tracking, OC-SORT, RobotDetector, YOLORobotDetector, drawing utilities |
+| 01_hsv_tuning.py | ~300 | HSV tuning with live trackbars |
+| 02_detection_test.py | ~200 | Full-video detection statistics |
+| 03_tracking_sandbox.py | ~330 | Tracking visualization and tuning |
 | 04_zones_and_shots.py | ~700 | Shot detection, polygon zones, robot integration |
-| 05_full_pipeline.py | ~320 | Two-pass production pipeline |
+| 05_full_pipeline.py | ~370 | Two-pass production pipeline with YOLO support |
 | 06_robot_tuning.py | ~350 | Robot bumper HSV tuning and ID correction |
-| 07_yolo_poc.py | ~350 | YOLO robot detection proof of concept |
+| 07_yolo_poc.py | ~580 | YOLO robot detection testing with custom model support |
+| 08_train_bumper_model.py | ~180 | Train custom YOLO model on bumper datasets |
 
 ## Debugging Tips
 
@@ -343,3 +359,103 @@ YOLO POC revealed pretrained COCO models don't recognize FRC robots. Training cu
 2. Test robot ID persistence through collisions
 3. Compare before/after on same video clips
 4. Tune `max_age` and `iou_threshold` for FRC scenarios
+
+### Session: 2026-02-11 - Custom YOLO Model Training & Pipeline Integration
+
+**Context:**
+Previous YOLO POC showed pretrained COCO models don't recognize FRC robots. Solution: train a custom YOLO model on labeled FRC bumper datasets from Roboflow.
+
+**Completed:**
+
+1. ✅ **Dataset Acquisition & Merging**
+   - Downloaded 3 Roboflow datasets: robot-bumpers-3, bumpers1, bumpers2
+   - Created merge script to combine datasets with filename prefixes
+   - Fixed data.yaml relative paths for ultralytics compatibility
+   - **Combined dataset:** 1,601 train / 442 valid / 192 test images
+   - Classes: `blue_bumper`, `red_bumper`
+
+2. ✅ **Training Script: `08_train_bumper_model.py`**
+   - Configurable epochs, batch size, image size, base model
+   - `--data` argument to select dataset (default: bumpers-merged)
+   - `--validate` mode for testing existing models
+   - `--resume` for continuing interrupted training
+   - Outputs to `models/bumper_detector.pt`
+
+3. ✅ **YOLORobotDetector Class** (~250 lines in frc_tracker_utils.py)
+   - Drop-in replacement for HSV-based RobotDetector
+   - Loads custom trained model from `models/bumper_detector.pt`
+   - Auto-detects alliance from class names (blue_bumper/red_bumper)
+   - Bbox expansion for full robot body estimation
+   - Same interface: `detect_and_track()`, `get_robot_at_position()`
+   - Integrates with existing OC-SORT/centroid trackers
+
+4. ✅ **07_yolo_poc.py Updates**
+   - `--model` CLI argument (auto-detects custom model if exists)
+   - `--expand` for bbox expansion factor
+   - Press 'E' to toggle expansion visualization
+   - Auto-classifies alliance from model class names
+
+5. ✅ **05_full_pipeline.py Updates**
+   - Checks `yolo_robot_detection.enabled` first
+   - Falls back to HSV if YOLO fails/disabled
+   - Stores robot states in Pass 1, draws in Pass 2
+   - Fixed bare expression bug on line 310
+
+6. ✅ **CuPy/CUDA 12.9 Compatibility Fix**
+   - Issue: CUDA 12.9 headers incompatible with CuPy's runtime-compiled morphology kernels
+   - Fix: Hybrid approach - GPU for HSV masking, CPU for morphology (OpenCV)
+   - Installed `cupy-cuda12x` for precompiled kernels
+   - Performance: ~55 fps on full pipeline
+
+**New Config Section:**
+```json
+"yolo_robot_detection": {
+    "enabled": true,
+    "model_path": "models/bumper_detector.pt",
+    "confidence_threshold": 0.5,
+    "bbox_expansion_factor": 1.5,
+    "use_tracker": "ocsort"
+}
+```
+
+**Training Results:**
+- Model: `models/bumper_detector.pt` (trained on merged dataset)
+- Classes: blue_bumper, red_bumper
+- Training logs: `runs/train/bumper/`
+
+**Pipeline Test Results (kettering1.mkv):**
+- 5,219 frames processed
+- ~55 fps (Pass 1), GPU path active
+- 302 shots detected
+- Robots attributed as red_unknown/blue_unknown (team numbers require manual assignment or OCR)
+- Output: `kettering1_annotated.mp4`, `kettering1_annotated_shots.csv`
+
+**Files Modified:**
+| File | Change |
+|------|--------|
+| `frc_tracker_utils.py` | +YOLORobotDetector class, fixed CuPy morphology for CUDA 12.9 |
+| `frc_tracker_config.json` | +yolo_robot_detection section, updated goal_regions |
+| `05_full_pipeline.py` | +YOLO support, +robot drawing in Pass 2, fixed line 310 |
+| `07_yolo_poc.py` | +--model/--expand args, +expansion viz, +auto alliance from class |
+
+**Files Created:**
+| File | Purpose |
+|------|---------|
+| `08_train_bumper_model.py` | YOLO training script |
+| `models/bumper_detector.pt` | Trained bumper detection model |
+| `bumpers-merged/` | Combined training dataset |
+
+**Status:** Full pipeline operational with YOLO robot detection. Ready for production use.
+
+**Workflow for New Venues:**
+```
+1. Run 01_hsv_tuning.py → tune ball detection for lighting
+2. Run 04_zones_and_shots.py → define goal regions (press 'g')
+3. Run 05_full_pipeline.py → process match recordings
+4. Review kettering1_annotated.mp4 and _shots.csv
+```
+
+**Future Enhancements:**
+- Fine-tune YOLO model on venue-specific data if needed
+- Add team number OCR or manual assignment workflow
+- Consider OC-SORT tracker for robot tracking (currently using centroid)
