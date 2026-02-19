@@ -1,125 +1,126 @@
-# FRC Ball Tracker - Sandbox
+# FRC Ball Tracker
 
-Multi-ball tracking pipeline for FRC "many ball shooter" games.  
-Detects yellow foam balls, tracks trajectories, attributes shots to robots, and determines scoring outcomes.
+Real-time multi-ball tracking for FRC scouting. Detects shots, attributes them to robots, and determines scoring outcomes at 60+ fps.
+
+![FRC Ball Tracker in action](readme_screengrab.png)
+
+## Features
+
+- **YOLO-based detection** for robots (red/blue bumpers) and balls
+- **Real-time processing** at 60+ fps with GPU acceleration
+- **Shot attribution** - knows which robot made each shot
+- **Three-tier classification** - shots, field passes, and ignored bounces
+- **OC-SORT tracking** with Kalman filtering and ID recovery after occlusions
+- **Hardware encoding** via NVENC for simultaneous display + recording
+- **Live camera support** including RTSP streams
+
+## Quick Start (Windows)
+
+```batch
+git clone https://github.com/63hz/scoutcam_pipeline.git
+cd scoutcam_pipeline
+install_frc_tracker.bat
+python verify_install.py
+```
+
+Then run the real-time pipeline:
+```batch
+python 10_realtime_pipeline.py path\to\match.mkv --output annotated.mp4
+```
+
+## Pipeline Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `01_hsv_tuning.py` | Interactive ball detection tuning |
+| `02_detection_test.py` | Validate detection across video |
+| `03_tracking_sandbox.py` | Multi-ball tracking visualization |
+| `04_zones_and_shots.py` | Define goals, robot zones, shot detection |
+| `05_full_pipeline.py` | Two-pass batch processing with retroactive coloring |
+| `06_robot_tuning.py` | Robot bumper HSV tuning |
+| `07_yolo_poc.py` | YOLO robot detection testing |
+| `08_train_bumper_model.py` | Train custom YOLO bumper model |
+| `09_train_ball_model.py` | Train custom YOLO ball model |
+| `10_realtime_pipeline.py` | **Real-time streaming pipeline** |
+
+## Game Day Workflow
+
+```
+1. Record test clip at venue
+2. Run 01_hsv_tuning.py → tune for lighting (press 's' to save)
+3. Run 04_zones_and_shots.py → define goal regions (press 'g')
+4. Run 10_realtime_pipeline.py on match recordings
+5. Review annotated video + shot CSV
+```
 
 ## Architecture
 
 ```
-frc_tracker/
-├── frc_tracker_config.json   # All tunable parameters (persisted)
-├── frc_tracker_utils.py      # Core components (detector, tracker, drawing)
-├── 01_hsv_tuning.py          # Interactive HSV + morphology + contour tuning
-├── 02_detection_test.py      # Validate detection across video, gather stats
-├── 03_tracking_sandbox.py    # Multi-ball tracking with trails + velocity
-├── 04_zones_and_shots.py     # Goal/robot zones + shot detection + attribution
-├── 05_full_pipeline.py       # Two-pass pipeline → annotated output video + CSV
-└── README.md                 # This file
+frc_tracker_config.json     # Single source of truth for all parameters
+         ↓
+frc_tracker_utils.py        # Core library (detectors, trackers, video I/O)
+         ↓
+stream_pipeline.py          # 5-stage threading pipeline for real-time
+         ↓
+10_realtime_pipeline.py     # Main entry point (60+ fps)
 ```
 
-## Workflow (Sequential)
+**Detection options:**
+- HSV color detection (CPU, requires per-venue tuning)
+- YOLO neural network (GPU, trained models included)
 
-### Step 1: HSV Tuning (`01_hsv_tuning.py`)
-- Select ROI to crop out chirons/overlays
-- Tune HSV color range for yellow ball detection via trackbars
-- Adjust morphological operations and contour filters
-- Step through frames to verify robustness across lighting changes
-- **Save config** when satisfied (press `s`)
+**Tracking:**
+- OC-SORT with Kalman filter and Hungarian algorithm
+- Handles occlusions and ID recovery
+- Separate trackers for balls and robots
 
-### Step 2: Detection Validation (`02_detection_test.py`)
-- Run detection across full video with saved config
-- Review detection counts per frame, processing time
-- Identify problem areas (false positives, missed detections)
-- Go back to Step 1 if needed
+## Output
 
-### Step 3: Tracking (`03_tracking_sandbox.py`)
-- Multi-ball centroid tracking with trail visualization
-- Tune `max_distance` (how far a ball can move between frames)
-- Tune `max_frames_missing` (how long to keep tracking a disappeared ball)
-- Toggle motion-only filter, velocity vectors, trails
-- **Save config** when tracking looks stable
+- **Annotated video** with trails, robot boxes, shot markers
+- **CSV log** with shot events: frame, position, robot attribution, outcome
+- **Real-time HUD** showing score breakdown by robot/alliance
 
-### Step 4: Zones & Shots (`04_zones_and_shots.py`)
-- Define goal regions (where scored balls end up)
-- Define robot zones (where robots are positioned/shooting from)
-- Run shot detection: ball launches → trajectory → score/miss
-- Review attribution and accuracy
-- Export shot log CSV
+## Requirements
 
-### Step 5: Full Pipeline (`05_full_pipeline.py`)
-- Two-pass processing for retroactive shot coloring
-- Pass 1: Analyze entire video, detect all shots, determine outcomes
-- Pass 2: Re-render with color coding from shot START (green=will score, red=will miss)
-- Outputs: annotated MP4 + shot log CSV
+- Python 3.9+
+- NVIDIA GPU with updated drivers
+- FFmpeg (for NVENC encoding)
+- ~3.5 GB disk space
 
-## Spyder Setup
-
-### Critical: External Terminal
-Scripts 01-04 use OpenCV's `highgui` windows with trackbars, which need a real display.
-
-**In Spyder:**
-1. Go to `Run → Configuration per file`
-2. Select `Execute in an external system terminal`
-3. This applies per-script, so set it for each interactive script
-
-Alternatively, run from terminal: `python 01_hsv_tuning.py path/to/video.mp4`
-
-### Cell Mode
-Scripts 02 and 03 have `# %%` cell markers for Spyder's cell execution mode.
-After running, inspect variables in Spyder's Variable Explorer.
-
-## Game Day Quick-Tune Workflow
-
-1. Record a short test clip at the venue
-2. Run `01_hsv_tuning.py` with the test clip
-3. Adjust HSV range for venue lighting (main thing that changes)
-4. Save config
-5. Verify with `02_detection_test.py`
-6. Run `05_full_pipeline.py` on match recordings
-
-The config JSON is the single source of truth — tune once, use everywhere.
-
-## Config Parameters Quick Reference
-
-| Section | Key | What it does |
-|---------|-----|--------------|
-| `hsv_yellow` | `h_low/h_high` | Hue range (most important for lighting changes) |
-| `hsv_yellow` | `s_low` | Saturation floor (raise if picking up non-yellow objects) |
-| `hsv_yellow` | `v_low` | Value/brightness floor (lower for dim venues) |
-| `morphology` | `open_kernel` | Removes small noise (increase if noisy) |
-| `morphology` | `close_kernel` | Fills gaps in detections (increase if balls look fragmented) |
-| `contour_filter` | `min_area` | Minimum blob size in pixels (adjust for camera distance) |
-| `contour_filter` | `min_circularity` | How round a blob must be (lower = more permissive) |
-| `tracking` | `max_distance` | Max pixels a ball can move between frames (increase for fast shots) |
-| `tracking` | `max_frames_missing` | Frames before dropping a lost track |
-| `shot_detection` | `min_upward_velocity` | vy threshold for shot detection (negative = upward) |
-| `shot_detection` | `min_speed` | Minimum speed to qualify as a shot |
-
-## Design Notes for Claude Code Migration
-
-The codebase is structured for easy refactoring:
-- `frc_tracker_utils.py` contains all reusable components with clean interfaces
-- Config is JSON-based, no hardcoded parameters
-- `BallDetector`, `CentroidTracker`, and `ShotDetector` are self-contained classes
-- Detection → Tracking → Shot Detection is a clean pipeline with per-frame state
-- The two-pass architecture in script 05 could become a single-pass streaming pipeline for live camera by removing retroactive coloring
-
-### Likely improvements for production:
-- Replace greedy centroid matching with Hungarian algorithm (scipy.optimize.linear_sum_assignment)
-- Add Kalman filter prediction for tracking through occlusions
-- GPU-accelerate HSV conversion + morphology with CUDA (if available)
-- Add robot tracking via bumper color detection (separate from ball detection)
-- Support multiple camera angles
-- Live dashboard with Streamlit or similar
-- YOLO-based detection as alternative/complement to HSV for robustness
-
-## Dependencies
-
+**Core packages:**
 ```
-pip install opencv-python numpy
+numpy, opencv-python, scipy, ultralytics, torch (CUDA)
 ```
 
-Optional for analysis:
-```
-pip install matplotlib pandas
-```
+See `requirements.txt` or run `install_frc_tracker.bat` for full setup.
+
+## Controls
+
+Most scripts support these keys:
+- `SPACE` - Pause/resume
+- `D` - Toggle debug view
+- `S` - Save config
+- `H` - Show help
+- `Q` / `ESC` - Quit
+
+## Configuration
+
+All parameters live in `frc_tracker_config.json`. Key sections:
+
+| Section | Purpose |
+|---------|---------|
+| `hsv_yellow` | Ball color detection range |
+| `contour_filter` | Size/shape filtering |
+| `tracking` | Ball tracker settings |
+| `robot_tracking` | OC-SORT parameters |
+| `shot_detection` | Velocity thresholds, classification |
+| `goal_regions` | Polygon zones for scoring |
+| `yolo_robot_detection` | YOLO model settings |
+
+## License
+
+MIT
+
+## Acknowledgments
+
+Built for FRC scouting teams to identify high-performing robots during alliance selection.
