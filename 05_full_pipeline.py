@@ -53,7 +53,7 @@ _spec.loader.exec_module(_mod)
 ShotDetector = _mod.ShotDetector
 
 
-VIDEO_PATH = "C:/Users/Clay/scoutcam_pipeline/kettering1.mkv"  # <-- SET THIS
+VIDEO_PATH = ""  # <-- SET THIS
 OUTPUT_PATH = ""  # Leave empty for auto-naming
 if not VIDEO_PATH and len(sys.argv) > 1:
     VIDEO_PATH = sys.argv[1]
@@ -110,7 +110,7 @@ def run_pipeline(video_path, output_path=None):
         robot_detector = RobotDetector(config)
         print("  [ROBOTS] HSV robot tracking enabled")
 
-    shot_detector = ShotDetector(config, robot_detector=robot_detector)
+    shot_detector = ShotDetector(config, robot_detector=robot_detector, fps=vid_info["fps"])
 
     # Store per-frame data for pass 2
     frame_data = []  # list of {detections, object_states}
@@ -158,6 +158,7 @@ def run_pipeline(video_path, output_path=None):
                     robot_states[rid] = {
                         "cx": robot.cx, "cy": robot.cy,
                         "bbox": robot.bbox,
+                        "robot_bbox": robot.robot_bbox,  # Expanded bbox for attribution
                         "alliance": robot.alliance,
                         "identity": robot.identity,
                     }
@@ -180,19 +181,70 @@ def run_pipeline(video_path, output_path=None):
     print(f"  Pass 1 complete: {frame_num} frames in {t_pass1:.1f}s "
           f"({frame_num/t_pass1:.0f} fps)")
 
-    # Build shot lookup: obj_id -> shot result
+    # Build shot lookup: obj_id -> shot result (with launch_frame for proper tracer coloring)
+    # Also build a list for computing live stats during Pass 2
     shot_results = {}
+    shot_events = []  # List of all shots with timing info for live stats
     for shot in shot_detector.shots:
-        shot_results[shot.obj_id] = {
+        shot_info = {
             "shot_id": shot.shot_id,
             "result": shot.result or "unresolved",
             "robot": shot.robot_name,
+            "launch_frame": shot.launch_frame,  # Track when shot was detected
+            "result_frame": shot.result_frame,  # When shot was resolved (scored/missed)
+            "launch_x": shot.launch_x,  # For origin marker
+            "launch_y": shot.launch_y,
+            "classification": shot.classification,  # "shot" or "field_pass"
+        }
+        shot_results[shot.obj_id] = shot_info
+        shot_events.append(shot_info)
+
+    def compute_live_stats(current_frame):
+        """Compute shot stats as of a specific frame (for live HUD updates)."""
+        from collections import defaultdict
+
+        # Only count shots that have been launched by current_frame
+        active_shots = [s for s in shot_events
+                        if s["launch_frame"] <= current_frame and s["classification"] == "shot"]
+        active_passes = [s for s in shot_events
+                         if s["launch_frame"] <= current_frame and s["classification"] == "field_pass"]
+
+        # Count results only if they've been resolved by current_frame
+        scored = sum(1 for s in active_shots
+                     if s["result"] == "scored" and s["result_frame"] and s["result_frame"] <= current_frame)
+        missed = sum(1 for s in active_shots
+                     if s["result"] == "missed" and s["result_frame"] and s["result_frame"] <= current_frame)
+
+        # In-flight = launched but not yet resolved
+        in_flight = len(active_shots) - scored - missed
+
+        # By-robot breakdown (shots only)
+        by_robot = defaultdict(lambda: {"scored": 0, "missed": 0, "total": 0})
+        for shot in active_shots:
+            r = shot["robot"]
+            # Only count if launched by current frame
+            by_robot[r]["total"] += 1
+            # Only count result if resolved by current frame
+            if shot["result_frame"] and shot["result_frame"] <= current_frame:
+                if shot["result"] == "scored":
+                    by_robot[r]["scored"] += 1
+                elif shot["result"] == "missed":
+                    by_robot[r]["missed"] += 1
+
+        return {
+            "shots_total": len(active_shots),
+            "shots_scored": scored,
+            "shots_missed": missed,
+            "shots_in_flight": in_flight,
+            "field_passes": len(active_passes),
+            "by_robot": dict(by_robot),
         }
 
     # Print stats
     final = shot_detector.get_stats()
     print(f"\n  Shots: {final['shots_total']} total, "
-          f"{final['shots_scored']} scored, {final['shots_missed']} missed")
+          f"{final['shots_scored']} scored, {final['shots_missed']} missed, "
+          f"{final.get('field_passes', 0)} field passes")
 
     # ==== PASS 2: Render annotated video ====
     print("\n" + "=" * 60)
@@ -231,11 +283,13 @@ def run_pipeline(video_path, output_path=None):
 
         # Draw robots if tracking enabled
         robot_states = fd.get("robot_states", {})
+        show_attribution_zone = config.get("output", {}).get("show_attribution_zone", False)
         if robot_states:
             for rid, rs in robot_states.items():
                 x, y, w, h = rs["bbox"]
                 alliance = rs["alliance"]
                 identity = rs["identity"]
+                robot_bbox = rs.get("robot_bbox")
 
                 # Color based on alliance
                 if alliance == "red":
@@ -243,7 +297,18 @@ def run_pipeline(video_path, output_path=None):
                 else:
                     color = (255, 0, 0)
 
-                # Draw bounding box
+                # Draw expanded robot bbox (attribution zone) if enabled
+                if show_attribution_zone and robot_bbox is not None:
+                    x1, y1, x2, y2 = robot_bbox
+                    # Dashed rectangle for attribution zone (lighter color)
+                    for i in range(x1, x2, 16):
+                        cv2.line(annotated, (i, y1), (min(i+8, x2), y1), color, 1)
+                        cv2.line(annotated, (i, y2), (min(i+8, x2), y2), color, 1)
+                    for i in range(y1, y2, 16):
+                        cv2.line(annotated, (x1, i), (x1, min(i+8, y2)), color, 1)
+                        cv2.line(annotated, (x2, i), (x2, min(i+8, y2)), color, 1)
+
+                # Draw bounding box (bumper)
                 cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
 
                 # Draw label
@@ -251,15 +316,44 @@ def run_pipeline(video_path, output_path=None):
                 cv2.putText(annotated, label, (x, y - 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
+        # Get tracer mode from config (all, shots_only, none)
+        tracer_mode = config.get("output", {}).get("tracer_mode", "all")
+
         # Draw tracked objects with retroactive shot coloring
         for oid, state in fd["object_states"].items():
             cx, cy = int(state["cx"]), int(state["cy"])
             radius = int(state["radius"])
 
+            # Check if this is a shot/field_pass and get launch frame
+            is_tracked_event = oid in shot_results
+            if is_tracked_event:
+                sr = shot_results[oid]
+                launch_frame = sr["launch_frame"]
+                classification = sr.get("classification", "shot")
+                is_shot = classification == "shot"
+                is_field_pass = classification == "field_pass"
+            else:
+                launch_frame = None
+                is_shot = False
+                is_field_pass = False
+
+            # Apply tracer_mode filtering
+            # - "none": skip all tracers
+            # - "shots_only": skip non-shot balls (but include field_passes if enabled)
+            # - "all": draw everything (default)
+            if tracer_mode == "none":
+                continue
+            if tracer_mode == "shots_only" and not is_tracked_event:
+                continue
+
             # Determine color from shot result (retroactive!)
-            if oid in shot_results:
-                result = shot_results[oid]["result"]
-                if result == "scored":
+            # Only apply shot color AFTER launch_frame to prevent pre-launch coloring
+            if is_tracked_event and (launch_frame is None or frame_num >= launch_frame):
+                result = sr["result"]
+                if is_field_pass:
+                    # Cyan for field passes
+                    color = (255, 255, 0)     # Cyan (BGR)
+                elif result == "scored":
                     color = (0, 255, 0)       # Green
                 elif result == "missed":
                     color = (0, 0, 255)       # Red
@@ -270,7 +364,7 @@ def run_pipeline(video_path, output_path=None):
             else:
                 color = (60, 60, 60)          # Dim gray (stationary)
 
-            # Trail
+            # Trail - only draw from launch_frame onward if this is a shot
             trail = state["trail"]
             if len(trail) > 1:
                 for i in range(1, len(trail)):
@@ -283,23 +377,35 @@ def run_pipeline(video_path, output_path=None):
             # Ball
             cv2.circle(annotated, (cx, cy), radius, color, 2)
 
+            # Draw origin marker (star) for "unknown" attributed shots
+            if is_tracked_event and sr["robot"] == "unknown" and is_shot:
+                origin_x, origin_y = int(sr["launch_x"]), int(sr["launch_y"])
+                # Yellow star marker at launch position
+                cv2.drawMarker(annotated, (origin_x, origin_y),
+                               (0, 255, 255),  # Yellow marker
+                               cv2.MARKER_STAR, 15, 2)
+
             # Label for shots
-            if oid in shot_results:
-                sr = shot_results[oid]
-                label = f"S{sr['shot_id']}"
+            if is_tracked_event:
+                if is_field_pass:
+                    label = f"P{sr['shot_id']}"  # P for pass
+                else:
+                    label = f"S{sr['shot_id']}"
                 if sr["robot"] != "unknown":
                     label += f":{sr['robot']}"
-                label += f" [{sr['result'].upper()}]"
+                if not is_field_pass:
+                    label += f" [{sr['result'].upper()}]"
                 cv2.putText(annotated, label, (cx + 8, cy - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-        # HUD
+        # HUD with LIVE stats (computed as of current frame)
+        live_shot_stats = compute_live_stats(frame_num)
         stats = {
             "balls_detected": fd["detections_count"],
             "balls_tracked": len(fd["object_states"]),
             "balls_moving": sum(1 for s in fd["object_states"].values()
                                 if s["is_moving"]),
-            **final,
+            **live_shot_stats,
         }
         annotated = draw_hud(annotated, stats, frame_num, total_frames)
 
@@ -335,11 +441,12 @@ def run_pipeline(video_path, output_path=None):
     print(f"  Time:    Pass1={t_pass1:.1f}s  Pass2={t_pass2:.1f}s  "
           f"Total={t_pass1+t_pass2:.1f}s")
     print(f"\n  Shot Summary:")
-    print(f"    Total:      {final['shots_total']}")
+    print(f"    Shots:      {final['shots_total']}")
     print(f"    Scored:     {final['shots_scored']}")
     print(f"    Missed:     {final['shots_missed']}")
+    print(f"    Passes:     {final.get('field_passes', 0)}")
     if final["by_robot"]:
-        print(f"\n  By Robot:")
+        print(f"\n  By Robot (shots only):")
         for robot, rs in final["by_robot"].items():
             pct = (rs["scored"] / rs["total"] * 100) if rs["total"] > 0 else 0
             print(f"    {robot}: {rs['scored']}/{rs['total']} "

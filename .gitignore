@@ -29,6 +29,7 @@ build/
 output_*.mp4
 shot_log.csv
 *_annotated_shots.csv
+*_realtime_shots.csv
 *_annotated.mp4
 
 # YOLO training datasets (large, download from Roboflow)
@@ -36,13 +37,18 @@ robot-bumpers-3/
 bumpers1/
 bumpers2/
 bumpers-merged/
+balls-dataset/
 *.zip
+
+# Reference images/screenshots
+balls/
 
 # YOLO training runs and pretrained models
 runs/
 yolov8*.pt
 yolo*.pt
 !models/bumper_detector.pt
+!models/ball_detector.pt
 
 # Temporary/debug files
 nul

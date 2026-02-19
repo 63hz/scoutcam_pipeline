@@ -1,14 +1,14 @@
 {
-    "_comment": "FRC Ball Tracker - Tunable Configuration. Edit directly or use 01_hsv_tuning.py to tune interactively.",
+    "_comment": "FRC Ball er - Tunable Configuration. Edit directly or use 01_hsv_tuning.py to tune interactively.",
     "video": {
-        "default_path": "kettering1.mkv",
+        "default_path": "kettering_final_2.mkv",
         "playback_speed": 1.0
     },
     "roi": {
-        "x": 4,
-        "y": 110,
-        "w": 1916,
-        "h": 787
+        "x": 6,
+        "y": 70,
+        "w": 1914,
+        "h": 760
     },
     "hsv_yellow": {
         "_comment": "HSV range for yellow ball detection. TUNE THIS ON GAME DAY.",
@@ -28,8 +28,8 @@
     },
     "contour_filter": {
         "_comment": "Contour filtering for ball candidates.",
-        "min_area": 47,
-        "max_area": 407,
+        "min_area": 43,
+        "max_area": 194,
         "min_circularity": 0.35,
         "min_aspect_ratio": 0.5,
         "max_aspect_ratio": 2.0
@@ -43,10 +43,10 @@
     },
     "cluster_splitting": {
         "_comment": "NMS-based cluster splitting for touching/overlapping balls. Preferred over watershed.",
-        "enabled": true,
+        "enabled": false,
         "method": "nms",
         "min_ball_radius": 5,
-        "peak_threshold": 0.57,
+        "peak_threshold": 0.56,
         "area_multiplier": 1.47,
         "max_cluster_area": 5000
     },
@@ -71,18 +71,62 @@
         "_comment": "Define scoring zones. Supports rectangles {name, x, y, w, h} or polygons {name, polygon: [[x,y],...]}. Use 'g' for rect, 'G' for polygon in 04_zones.py.",
         "regions": [
             {
-                "name": "red_hub",
-                "x": 1216,
-                "y": 228,
-                "w": 151,
-                "h": 80
+                "name": "RED_HUB",
+                "polygon": [
+                    [
+                        1328,
+                        269
+                    ],
+                    [
+                        1376,
+                        293
+                    ],
+                    [
+                        1351,
+                        321
+                    ],
+                    [
+                        1277,
+                        320
+                    ],
+                    [
+                        1233,
+                        293
+                    ],
+                    [
+                        1264,
+                        268
+                    ]
+                ]
             },
             {
-                "name": "blue_hub",
-                "x": 349,
-                "y": 232,
-                "w": 148,
-                "h": 81
+                "name": "BLUE_HUB",
+                "polygon": [
+                    [
+                        365,
+                        323
+                    ],
+                    [
+                        345,
+                        294
+                    ],
+                    [
+                        396,
+                        272
+                    ],
+                    [
+                        465,
+                        273
+                    ],
+                    [
+                        488,
+                        297
+                    ],
+                    [
+                        448,
+                        323
+                    ]
+                ]
             }
         ]
     },
@@ -93,18 +137,43 @@
     "shot_detection": {
         "_comment": "Parameters for identifying shots (balls in upward/arcing flight).",
         "min_upward_velocity": -3.0,
+        "min_downward_velocity": 2.0,
+        "require_bbox_exit": true,
         "min_speed": 5.0,
+        "min_shot_speed": 8.0,
         "proximity_to_robot": 120,
-        "min_flight_frames": 4
+        "min_flight_frames": 4,
+        "goal_proximity_x": 150,
+        "goal_proximity_y": 100,
+        "classify_field_passes": false
+    },
+    "human_player_zones": {
+        "_comment": "Define human player zones for shot attribution. Supports polygons and rectangles.",
+        "enabled": true,
+        "zones": [
+            {
+                "name": "qs",
+                "x": 1522,
+                "y": 40,
+                "w": 389,
+                "h": 261
+            }
+        ]
     },
     "robot_tracking": {
         "_comment": "OC-SORT tracker for robust robot tracking. Set tracker to 'ocsort' or 'centroid'.",
-        "tracker": "centroid",
+        "tracker": "ocsort",
         "max_age": 15,
         "min_hits": 3,
         "iou_threshold": 0.3,
-        "use_oru": false,
-        "use_ocm": false
+        "use_oru": true,
+        "use_ocm": true,
+        "dead_track_max_age": 90,
+        "enable_reidentification": true,
+        "alliance_counts": {
+            "red": 3,
+            "blue": 3
+        }
     },
     "robot_detection": {
         "_comment": "Dynamic robot tracking by bumper color. Use 06_robot_tuning.py to tune HSV values.",
@@ -144,15 +213,31 @@
         "enabled": true,
         "model_path": "models/bumper_detector.pt",
         "confidence_threshold": 0.5,
-        "bbox_expansion_factor": 1.5,
+        "bbox_expansion_factor": 2.0,
         "use_tracker": "ocsort"
+    },
+    "yolo_ball_detection": {
+        "_comment": "YOLO-based ball detection for real-time pipeline. Use 09_train_ball_model.py to train.",
+        "enabled": false,
+        "model_path": "models/ball_detector.pt",
+        "confidence_threshold": 0.3
+    },
+    "input": {
+        "_comment": "Input source settings for live camera or RTSP streams.",
+        "source": null,
+        "camera_fps_override": null,
+        "drop_frames_if_behind": true
     },
     "output": {
         "annotated_video_path": "output_annotated.mp4",
         "csv_path": "shot_log.csv",
         "codec": "mp4v",
+        "use_nvenc": true,
+        "nvenc_preset": "p4",
+        "nvenc_cq": 23,
         "draw_trails": true,
         "draw_ids": true,
+        "tracer_mode": "shots_only",
         "trail_color_scored": [
             0,
             255,
@@ -167,6 +252,11 @@
             0,
             255,
             255
+        ],
+        "trail_color_field_pass": [
+            255,
+            255,
+            0
         ]
     }
 }

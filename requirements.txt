@@ -1,0 +1,26 @@
+# FRC Ball Tracker - Python Dependencies
+# Install with: pip install -r requirements.txt
+# Note: For CUDA-enabled PyTorch, use the batch script instead
+
+# Core (required)
+numpy>=1.21.0
+opencv-python>=4.5.0
+scipy>=1.7.0
+
+# YOLO detection (required for robot tracking)
+ultralytics>=8.0.0
+
+# PyTorch - install separately with CUDA support:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Uncomment below for CPU-only (not recommended):
+# torch>=2.0.0
+# torchvision>=0.15.0
+
+# GPU acceleration (optional but recommended)
+# Install separately: pip install cupy-cuda12x
+# Or for CUDA 11: pip install cupy-cuda11x
+
+# Optional extras
+easyocr>=1.6.0
+pandas>=1.3.0
+matplotlib>=3.4.0

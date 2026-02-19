@@ -64,6 +64,8 @@ CONTROLS:
     u      - Toggle blue bumper detection ON/OFF
     d      - Toggle debug view (shows color masks)
     c      - Click-to-correct mode (click robot, enter team number)
+    i      - ID assignment mode (assign team numbers to robots)
+    m      - Merge mode (click two robots to merge their IDs)
     s      - Save HSV config values
     q/ESC  - Quit
 
@@ -205,14 +207,14 @@ def create_debug_view(frame, detector, robots):
     return np.vstack([np.hstack([tl, tr]), np.hstack([bl, br])])
 
 
-def draw_hud(frame, robots, frame_num, total_frames, show_red, show_blue, correction_mode, tracker_stats=None):
+def draw_hud(frame, robots, frame_num, total_frames, show_red, show_blue, correction_mode, tracker_stats=None, merge_mode=False, merge_first_id=None):
     """Draw HUD with robot stats and status."""
     out = frame.copy()
     h, w = out.shape[:2]
 
     # Background panel - taller to fit tracker stats
     overlay = out.copy()
-    cv2.rectangle(overlay, (0, 0), (380, 170), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, 0), (380, 195), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.6, out, 0.4, 0, out)
 
     # Stats
@@ -234,10 +236,12 @@ def draw_hud(frame, robots, frame_num, total_frames, show_red, show_blue, correc
         tracker_type = tracker_stats.get("tracker_type", "unknown").upper()
         active = tracker_stats.get("active_tracks", 0)
         confirmed = tracker_stats.get("confirmed_tracks", 0)
+        dead = tracker_stats.get("dead_tracks", 0)
         if tracker_type == "OCSORT":
             matches = tracker_stats.get("matches", 0)
-            lines.append(f"Tracker: {tracker_type} (active:{active} conf:{confirmed})")
-            lines.append(f"Matches: {matches}")
+            reids = tracker_stats.get("reidentifications", 0)
+            lines.append(f"Tracker: {tracker_type} (act:{active} conf:{confirmed} dead:{dead})")
+            lines.append(f"Matches: {matches}  Re-IDs: {reids}")
         else:
             lines.append(f"Tracker: {tracker_type} (active:{active})")
 
@@ -252,8 +256,15 @@ def draw_hud(frame, robots, frame_num, total_frames, show_red, show_blue, correc
 
     # Mode indicators
     if correction_mode:
-        cv2.putText(out, "CORRECTION MODE - Click a robot, then type team # in console",
+        cv2.putText(out, "ID MODE - Click a robot, then type team # in console",
                     (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+    elif merge_mode:
+        if merge_first_id is not None:
+            cv2.putText(out, f"MERGE MODE - Selected ID {merge_first_id}, click second robot",
+                        (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+        else:
+            cv2.putText(out, "MERGE MODE - Click first robot to merge",
+                        (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
 
     return out
 
@@ -278,7 +289,8 @@ def print_help():
     n / b  - Step forward / backward one frame
     d      - Toggle debug view (shows color masks)
     r / u  - Toggle red / blue detection
-    c      - Correction mode (click robot, type team # in console)
+    c / i  - ID assignment mode (click robot, type team # in console)
+    m      - Merge mode (click two robots to link their track IDs)
     s      - Save config
     q      - Quit
 
@@ -320,49 +332,87 @@ def main():
     show_red = True
     show_blue = True
     correction_mode = False
+    merge_mode = False
+    merge_first_id = None  # First robot ID for merge operation
     playback_delay = int(1000 / vid_info["fps"])
     frame_num = 0
     current_frame = None
 
-    # Mouse callback for correction mode
+    # Mouse callback for correction and merge modes
     def mouse_callback(event, x, y, flags, param):
-        nonlocal correction_mode
-        if event == cv2.EVENT_LBUTTONDOWN and correction_mode:
-            # Scale coordinates if in debug view (each quadrant is half size)
-            if show_debug:
-                # Only respond to clicks in top-left quadrant (detections)
-                roi_frame = apply_roi(current_frame, config["roi"])
-                h, w = roi_frame.shape[:2]
-                qw, qh = w // 2, h // 2
-                if x > qw or y > qh:
-                    print("  (Click in the top-left quadrant to select a robot)")
-                    return
-                # Scale up the coordinates
-                x = x * 2
-                y = y * 2
+        nonlocal correction_mode, merge_mode, merge_first_id
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        if not correction_mode and not merge_mode:
+            return
 
-            # Find nearest robot
-            robots = detector.get_all_robots()
-            min_dist = float("inf")
-            nearest = None
+        # Scale coordinates if in debug view (each quadrant is half size)
+        if show_debug:
+            # Only respond to clicks in top-left quadrant (detections)
+            roi_frame = apply_roi(current_frame, config["roi"])
+            h, w = roi_frame.shape[:2]
+            qw, qh = w // 2, h // 2
+            if x > qw or y > qh:
+                print("  (Click in the top-left quadrant to select a robot)")
+                return
+            # Scale up the coordinates
+            x = x * 2
+            y = y * 2
 
-            for rid, robot in robots.items():
-                dist = ((x - robot.cx)**2 + (y - robot.cy)**2)**0.5
-                if dist < min_dist:
-                    min_dist = dist
-                    nearest = robot
+        # Find nearest robot
+        robots = detector.get_all_robots()
+        min_dist = float("inf")
+        nearest = None
 
-            if nearest and min_dist < 100:
-                print(f"\n  Selected: {nearest.identity} (tracking ID: {nearest.id})")
-                team = input(f"  Enter team number (or ENTER to cancel): ").strip()
-                if team and team.isdigit():
-                    detector.apply_correction(nearest.id, team)
-                    print(f"  -> Set to {nearest.alliance}_{team}")
-                else:
-                    print("  -> Cancelled")
-                correction_mode = False
+        for rid, robot in robots.items():
+            dist = ((x - robot.cx)**2 + (y - robot.cy)**2)**0.5
+            if dist < min_dist:
+                min_dist = dist
+                nearest = robot
+
+        if not nearest or min_dist >= 100:
+            print("  (No robot found near click location)")
+            return
+
+        if correction_mode:
+            print(f"\n  Selected: {nearest.identity} (tracking ID: {nearest.id})")
+            team = input(f"  Enter team number (or ENTER to cancel): ").strip()
+            if team and team.isdigit():
+                detector.apply_correction(nearest.id, team)
+                print(f"  -> Set to {nearest.alliance}_{team}")
             else:
-                print("  (No robot found near click location)")
+                print("  -> Cancelled")
+            correction_mode = False
+
+        elif merge_mode:
+            if merge_first_id is None:
+                # First robot selection
+                merge_first_id = nearest.id
+                print(f"\n  First robot: {nearest.identity} (ID: {nearest.id})")
+                print("  Now click on the SECOND robot to merge, or press ESC to cancel")
+            else:
+                # Second robot selection
+                if nearest.id == merge_first_id:
+                    print("  (Same robot selected twice - cancelled)")
+                    merge_mode = False
+                    merge_first_id = None
+                    return
+
+                print(f"  Second robot: {nearest.identity} (ID: {nearest.id})")
+                team = input(f"  Enter team number for merged robot (or ENTER to skip): ").strip()
+                team_num = team if team and team.isdigit() else None
+
+                # Perform merge
+                if hasattr(detector, '_ocsort') and detector._ocsort is not None:
+                    detector._ocsort.merge_tracks(merge_first_id, nearest.id, team_num)
+                    print(f"  -> Merged tracks {merge_first_id} and {nearest.id}")
+                    if team_num:
+                        print(f"     Assigned team number: {team_num}")
+                else:
+                    print("  -> Merge only available with OC-SORT tracker")
+
+                merge_mode = False
+                merge_first_id = None
 
     cv2.setMouseCallback(video_win, mouse_callback)
 
@@ -406,7 +456,8 @@ def main():
         else:
             display = draw_robots(roi_frame, robots)
             display = draw_hud(display, robots, frame_num, vid_info["frame_count"],
-                               show_red, show_blue, correction_mode, tracker_stats)
+                               show_red, show_blue, correction_mode, tracker_stats,
+                               merge_mode, merge_first_id)
 
         cv2.imshow(video_win, display)
 
@@ -449,7 +500,25 @@ def main():
             print(f"  Blue detection: {'ON' if show_blue else 'OFF'}")
         elif key == ord('c'):
             correction_mode = True
+            merge_mode = False
+            merge_first_id = None
             print("\n  CORRECTION MODE: Click on a robot in the video window...")
+        elif key == ord('i'):
+            # Same as 'c' - ID assignment mode
+            correction_mode = True
+            merge_mode = False
+            merge_first_id = None
+            print("\n  ID ASSIGNMENT MODE: Click on a robot to assign a team number...")
+        elif key == ord('m'):
+            merge_mode = True
+            correction_mode = False
+            merge_first_id = None
+            print("\n  MERGE MODE: Click on the FIRST robot...")
+        elif key == 27 and (correction_mode or merge_mode):  # ESC to cancel modes
+            correction_mode = False
+            merge_mode = False
+            merge_first_id = None
+            print("  -> Mode cancelled")
         elif key == ord('s'):
             save_config(config)
             print("  Config saved!")

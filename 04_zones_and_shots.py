@@ -80,7 +80,7 @@ class ShotDetector:
         it remains attributed to the original launching robot.
     """
 
-    def __init__(self, config, robot_detector=None):
+    def __init__(self, config, robot_detector=None, fps=30.0):
         """
         Initialize shot detector.
 
@@ -88,24 +88,79 @@ class ShotDetector:
             config: Configuration dict
             robot_detector: Optional RobotDetector for dynamic robot tracking.
                            If None, falls back to static robot zones from config.
+            fps: Video frame rate (used to scale velocity thresholds)
         """
         self.config = config
         self.robot_detector = robot_detector
+        self.fps = fps
 
         shot_cfg = config.get("shot_detection", {})
-        self.min_upward_vy = shot_cfg.get("min_upward_velocity", -3.0)
-        self.min_speed = shot_cfg.get("min_speed", 5.0)
+
+        # Config thresholds are tuned for 30fps - scale for actual fps
+        # At higher fps, per-frame velocity is lower (same real-world speed)
+        fps_scale = 30.0 / fps  # e.g., 0.5 for 60fps
+
+        self.min_upward_vy = shot_cfg.get("min_upward_velocity", -3.0) * fps_scale
+        self.min_downward_vy = shot_cfg.get("min_downward_velocity", 2.0) * fps_scale
+        self.require_bbox_exit = shot_cfg.get("require_bbox_exit", False)
+        self.min_speed = shot_cfg.get("min_speed", 5.0) * fps_scale
+        self.min_shot_speed = shot_cfg.get("min_shot_speed", 8.0) * fps_scale
         self.proximity = shot_cfg.get("proximity_to_robot", 120)
-        self.min_flight_frames = shot_cfg.get("min_flight_frames", 4)
+
+        # Goal proximity thresholds (for trajectory-based classification)
+        self.goal_proximity_x = shot_cfg.get("goal_proximity_x", 150)
+        self.goal_proximity_y = shot_cfg.get("goal_proximity_y", 100)
+        self.classify_field_passes = shot_cfg.get("classify_field_passes", True)
+
+        # Scale flight frames for fps (more frames at higher fps for same duration)
+        base_flight_frames = shot_cfg.get("min_flight_frames", 4)
+        self.min_flight_frames = max(1, int(base_flight_frames / fps_scale))
+
+        # Velocity smoothing: use averaged velocity to reduce jitter at high fps
+        # At high fps, per-frame velocity is noisy due to small centroid errors
+        self.use_smoothed_velocity = fps > 45  # Auto-enable for high fps
+        self.velocity_smoothing_window = max(2, int(3 / fps_scale))  # ~3 frames at 30fps
+
+        # Print scaled thresholds if fps differs from reference
+        if abs(fps - 30.0) > 1.0:
+            smooth_note = f", smoothing={self.velocity_smoothing_window}f" if self.use_smoothed_velocity else ""
+            print(f"  [SHOTS] FPS-adjusted thresholds for {fps:.0f}fps: "
+                  f"vy<{self.min_upward_vy:.1f}, speed>{self.min_speed:.1f}, "
+                  f"flight>={self.min_flight_frames} frames{smooth_note}")
 
         self.goal_regions = config.get("goal_regions", {}).get("regions", [])
         self.robot_zones = config.get("robot_zones", {}).get("robots", [])
+
+        # Human player zones (for shot attribution)
+        hp_cfg = config.get("human_player_zones", {})
+        self.hp_zones_enabled = hp_cfg.get("enabled", False)
+        self.hp_zones = hp_cfg.get("zones", [])
 
         # Active shot tracking
         self.shots = []           # list of ShotEvent
         self.active_shots = {}    # obj_id -> ShotEvent (in-flight)
         self.ball_launch_candidates = {}  # obj_id -> frame count of upward motion
+        self.ball_launch_origins = {}  # obj_id -> (x, y, frame) when upward flight started
+        self.ball_prev_positions = {}  # obj_id -> (prev_x, prev_y) for bbox exit detection
         self.scored_ball_ids = set()  # obj_ids that have entered a goal (prevent bounce-out double-counting)
+
+        # Callbacks for real-time streaming (Phase 2)
+        self._on_shot_launched = None
+        self._on_shot_resolved = None
+
+    def set_callbacks(self, on_shot_launched=None, on_shot_resolved=None):
+        """
+        Register callbacks for real-time shot event notifications.
+
+        Args:
+            on_shot_launched: Callback(shot_event, frame_num) when a shot is detected
+            on_shot_resolved: Callback(shot_event, frame_num) when a shot is resolved (scored/missed)
+
+        For streaming pipeline, this allows immediate CSV logging without waiting
+        for the full video to process.
+        """
+        self._on_shot_launched = on_shot_launched
+        self._on_shot_resolved = on_shot_resolved
 
     def update(self, tracked_objects, frame_num):
         """
@@ -130,8 +185,20 @@ class ShotDetector:
                     shot = self.active_shots[obj_id]
                     if not shot.resolved:
                         shot.resolve("missed", frame_num)
+                        if self._on_shot_resolved:
+                            self._on_shot_resolved(shot, frame_num)
                     del self.active_shots[obj_id]
+                # Clean up tracking state for disappeared ball
+                if obj_id in self.ball_prev_positions:
+                    del self.ball_prev_positions[obj_id]
+                if obj_id in self.ball_launch_candidates:
+                    del self.ball_launch_candidates[obj_id]
+                if obj_id in self.ball_launch_origins:
+                    del self.ball_launch_origins[obj_id]
                 continue
+
+            # Get previous position for bbox exit detection
+            prev_pos = self.ball_prev_positions.get(obj_id, (obj.cx, obj.cy))
 
             # Check if ball is already being tracked as a shot
             if obj_id in self.active_shots:
@@ -141,54 +208,131 @@ class ShotDetector:
                 # Check if ball entered goal region
                 for goal in self.goal_regions:
                     if self._point_in_goal(obj.cx, obj.cy, goal):
-                        shot.resolve("scored", frame_num, goal["name"])
-                        self.scored_ball_ids.add(obj_id)
-                        ids_to_remove.append(obj_id)
-                        del self.active_shots[obj_id]
-                        break
+                        # Rigorous check: only count as scored if ball is moving DOWNWARD
+                        # This prevents rim bounces (where ball enters goal region sideways/upward)
+                        # from being counted as scored
+                        if obj.vy >= self.min_downward_vy:
+                            shot.resolve("scored", frame_num, goal["name"])
+                            if self._on_shot_resolved:
+                                self._on_shot_resolved(shot, frame_num)
+                            self.scored_ball_ids.add(obj_id)
+                            ids_to_remove.append(obj_id)
+                            del self.active_shots[obj_id]
+                            break
+                        # Ball in goal region but not moving downward - might be bouncing off rim
+                        # Don't resolve yet, let it continue tracking
 
                 # Check if shot has been in flight too long (timeout)
                 if (obj_id in self.active_shots and
                     frame_num - shot.launch_frame > 90):  # ~3 sec at 30fps
                     shot.resolve("missed", frame_num)
+                    if self._on_shot_resolved:
+                        self._on_shot_resolved(shot, frame_num)
                     del self.active_shots[obj_id]
 
+                # Update previous position
+                self.ball_prev_positions[obj_id] = (obj.cx, obj.cy)
                 continue
 
             # ---- New shot detection ----
+            # Get velocity (smoothed for high fps, instantaneous otherwise)
+            if self.use_smoothed_velocity and hasattr(obj, 'get_smoothed_velocity'):
+                _, vy, speed = obj.get_smoothed_velocity(self.velocity_smoothing_window)
+            else:
+                vy, speed = obj.vy, obj.speed
+
             # Is this ball moving upward and fast?
-            if obj.vy < self.min_upward_vy and obj.speed > self.min_speed:
+            if vy < self.min_upward_vy and speed > self.min_speed:
                 # Count consecutive upward frames
                 if obj_id not in self.ball_launch_candidates:
                     self.ball_launch_candidates[obj_id] = 1
+                    # Store the origin position when upward flight FIRST starts
+                    # This is where the ball was when it began moving upward
+                    self.ball_launch_origins[obj_id] = (obj.cx, obj.cy, frame_num)
                 else:
                     self.ball_launch_candidates[obj_id] += 1
 
-                # Enough consecutive upward frames = confirmed shot
+                # Enough consecutive upward frames = confirmed shot candidate
                 if self.ball_launch_candidates[obj_id] >= self.min_flight_frames:
-                    # Find nearest robot zone for attribution
-                    robot_name = self._find_nearest_robot(obj)
-
-                    shot = ShotEvent(
-                        shot_id=len(self.shots),
-                        obj_id=obj_id,
-                        launch_x=obj.cx,
-                        launch_y=obj.cy,
-                        launch_frame=frame_num,
-                        robot_name=robot_name,
+                    # Get the origin position where upward flight started
+                    origin_x, origin_y, origin_frame = self.ball_launch_origins.get(
+                        obj_id, (obj.cx, obj.cy, frame_num)
                     )
-                    self.shots.append(shot)
-                    self.active_shots[obj_id] = shot
 
-                    # Tag the tracked object
-                    obj.shot_id = shot.shot_id
-                    obj.robot_id = robot_name
+                    # Determine robot attribution based on ORIGIN position (not current)
+                    robot_name = None
+                    should_create_shot = True
 
-                    del self.ball_launch_candidates[obj_id]
+                    if self.require_bbox_exit and self.robot_detector is not None:
+                        # STRICT MODE: Attribution based on where the ball STARTED its flight
+                        # Check if the ball's origin was inside any robot's expanded bbox
+                        inside, origin_robot = self.robot_detector.point_in_robot_bbox(
+                            origin_x, origin_y
+                        )
+                        if inside:
+                            # Ball started inside a robot bbox - attribute to that robot
+                            robot_name = origin_robot
+                        else:
+                            # Ball didn't start inside any tracked robot
+                            # This could be: untracked robot, human player, or noise
+                            # Check human player zones
+                            robot_name = self._check_hp_zones(origin_x, origin_y)
+                            if robot_name is None:
+                                # Not in HP zone either - attribute to unknown
+                                robot_name = "unknown"
+                    else:
+                        # RELAXED MODE: Use nearest robot fallback
+                        robot_name = self._find_nearest_robot(obj)
+
+                    if should_create_shot:
+                        # Classify this ball movement (shot vs field_pass vs ignored)
+                        classification = self._classify_shot(
+                            origin_x, origin_y, obj.vx, obj.vy, speed
+                        )
+
+                        # Skip if classified as ignored (slow bounces, ejector dribbles)
+                        if classification == "ignored":
+                            # Clean up candidate tracking
+                            del self.ball_launch_candidates[obj_id]
+                            if obj_id in self.ball_launch_origins:
+                                del self.ball_launch_origins[obj_id]
+                            continue
+
+                        # Use origin position for the shot record (where it actually started)
+                        shot = ShotEvent(
+                            shot_id=len(self.shots),
+                            obj_id=obj_id,
+                            launch_x=origin_x,
+                            launch_y=origin_y,
+                            launch_frame=origin_frame,
+                            robot_name=robot_name,
+                            classification=classification,
+                        )
+                        self.shots.append(shot)
+                        self.active_shots[obj_id] = shot
+
+                        # Fire callback for real-time streaming
+                        if self._on_shot_launched:
+                            self._on_shot_launched(shot, frame_num)
+
+                        # Tag the tracked object
+                        obj.shot_id = shot.shot_id
+                        obj.robot_id = robot_name
+                        obj.classification = classification
+
+                        # Clean up candidate tracking
+                        del self.ball_launch_candidates[obj_id]
+                        if obj_id in self.ball_launch_origins:
+                            del self.ball_launch_origins[obj_id]
             else:
                 # Reset candidate counter if ball stops going up
                 if obj_id in self.ball_launch_candidates:
                     del self.ball_launch_candidates[obj_id]
+                if obj_id in self.ball_launch_origins:
+                    del self.ball_launch_origins[obj_id]
+
+            # Update previous position
+            self.ball_prev_positions[obj_id] = (obj.cx, obj.cy)
 
         return ids_to_remove
 
@@ -205,14 +349,22 @@ class ShotDetector:
 
     def _find_nearest_robot(self, obj):
         """
-        Find which robot the ball is closest to at launch time.
+        Find which robot/human player the ball is closest to at launch time.
 
-        Uses dynamic RobotDetector if available, otherwise falls back
-        to static robot zones from config.
+        Priority order:
+        1. Human player zones (if enabled and ball is inside)
+        2. Dynamic RobotDetector (if available)
+        3. Static robot zones from config
 
         Note: Attribution is locked at launch time (occlusion-safe).
         """
-        # Try dynamic robot detection first
+        # Check human player zones first (highest priority)
+        if self.hp_zones_enabled and self.hp_zones:
+            for zone in self.hp_zones:
+                if self._point_in_hp_zone(obj.cx, obj.cy, zone):
+                    return zone.get("name", "human_player")
+
+        # Try dynamic robot detection
         if self.robot_detector is not None:
             robot_id = self.robot_detector.get_robot_at_position(
                 obj.cx, obj.cy, max_distance=self.proximity
@@ -239,16 +391,193 @@ class ShotDetector:
 
         return nearest
 
+    def _point_in_hp_zone(self, px, py, zone):
+        """
+        Check if point is inside a human player zone.
+        Supports both polygon and rectangle formats.
+        """
+        # Check for polygon format first
+        if "polygon" in zone and zone["polygon"]:
+            return point_in_polygon(px, py, zone["polygon"])
+        # Fall back to rectangle format
+        if "x" in zone:
+            return point_in_rect(px, py, zone)
+        return False
+
+    def _check_hp_zones(self, x, y):
+        """
+        Check if a point is inside any human player zone.
+
+        Args:
+            x, y: Point to check
+
+        Returns:
+            str or None: Zone name if inside an HP zone, None otherwise
+        """
+        if not self.hp_zones_enabled or not self.hp_zones:
+            return None
+
+        for zone in self.hp_zones:
+            if self._point_in_hp_zone(x, y, zone):
+                return zone.get("name", "human_player")
+
+        return None
+
+    def _classify_shot(self, launch_x, launch_y, vx, vy, speed):
+        """
+        Classify a detected ball movement into shot, field_pass, or ignored.
+
+        Three-tier classification:
+        - Below min_shot_speed: IGNORED (slow bounces, ejector dribbles)
+        - Above min_shot_speed + trajectory near goal: SHOT
+        - Above min_shot_speed + NOT near goal: FIELD_PASS
+
+        Args:
+            launch_x, launch_y: Launch position
+            vx, vy: Velocity components
+            speed: Ball speed
+
+        Returns:
+            str: "shot", "field_pass", or "ignored"
+        """
+        # Below shot threshold = ignore (bounces, ejector dribbles)
+        if speed < self.min_shot_speed:
+            return "ignored"
+
+        # If classification is disabled, everything above threshold is a shot
+        if not self.classify_field_passes:
+            return "shot"
+
+        # Check if trajectory passes near any goal
+        if self._trajectory_near_goal(launch_x, launch_y, vx, vy):
+            return "shot"
+
+        return "field_pass"
+
+    def _trajectory_near_goal(self, launch_x, launch_y, vx, vy):
+        """
+        Check if ball trajectory passes near any goal region.
+
+        Projects the ball's trajectory as a ray from launch point and checks
+        if it intersects an expanded rectangle around each goal region.
+
+        Args:
+            launch_x, launch_y: Launch position
+            vx, vy: Velocity components
+
+        Returns:
+            bool: True if trajectory passes near a goal
+        """
+        if not self.goal_regions:
+            return False
+
+        for goal in self.goal_regions:
+            # Get goal bounds (handle polygon or rect format)
+            gx1, gy1, gx2, gy2 = self._get_goal_bounds(goal)
+
+            # Expand bounds by proximity thresholds
+            gx1 -= self.goal_proximity_x
+            gx2 += self.goal_proximity_x
+            gy1 -= self.goal_proximity_y
+            gy2 += self.goal_proximity_y
+
+            # Project trajectory - check if it intersects expanded region
+            if self._trajectory_intersects_rect(launch_x, launch_y, vx, vy,
+                                                 gx1, gy1, gx2, gy2):
+                return True
+
+        return False
+
+    def _get_goal_bounds(self, goal):
+        """
+        Get bounding box for a goal region.
+
+        Handles both polygon and rectangle formats.
+
+        Args:
+            goal: Goal dict with either 'polygon' or 'x,y,w,h' keys
+
+        Returns:
+            tuple: (x1, y1, x2, y2) bounding box
+        """
+        if "polygon" in goal and goal["polygon"]:
+            # Get bounding box of polygon
+            points = goal["polygon"]
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            return (min(xs), min(ys), max(xs), max(ys))
+        else:
+            # Rectangle format
+            return (goal["x"], goal["y"],
+                    goal["x"] + goal["w"], goal["y"] + goal["h"])
+
+    def _trajectory_intersects_rect(self, x, y, vx, vy, rx1, ry1, rx2, ry2):
+        """
+        Check if a ray from (x,y) with direction (vx,vy) intersects a rectangle.
+
+        Uses parametric ray intersection with axis-aligned bounding box.
+        Only checks forward direction (positive t values).
+
+        Args:
+            x, y: Ray origin
+            vx, vy: Ray direction (velocity)
+            rx1, ry1, rx2, ry2: Rectangle bounds
+
+        Returns:
+            bool: True if ray intersects rectangle
+        """
+        # Handle near-zero velocities to avoid division issues
+        epsilon = 1e-6
+
+        # Check if already inside the rectangle
+        if rx1 <= x <= rx2 and ry1 <= y <= ry2:
+            return True
+
+        # For each axis, compute t values at which ray intersects the slab
+        if abs(vx) < epsilon:
+            # Ray is parallel to Y axis
+            if not (rx1 <= x <= rx2):
+                return False
+            tx_min, tx_max = float('-inf'), float('inf')
+        else:
+            tx1 = (rx1 - x) / vx
+            tx2 = (rx2 - x) / vx
+            tx_min, tx_max = min(tx1, tx2), max(tx1, tx2)
+
+        if abs(vy) < epsilon:
+            # Ray is parallel to X axis
+            if not (ry1 <= y <= ry2):
+                return False
+            ty_min, ty_max = float('-inf'), float('inf')
+        else:
+            ty1 = (ry1 - y) / vy
+            ty2 = (ry2 - y) / vy
+            ty_min, ty_max = min(ty1, ty2), max(ty1, ty2)
+
+        # Find overlap of t ranges
+        t_enter = max(tx_min, ty_min)
+        t_exit = min(tx_max, ty_max)
+
+        # Check if there's a valid intersection in the forward direction
+        # t_enter <= t_exit means ranges overlap
+        # t_exit >= 0 means intersection is in forward direction
+        return t_enter <= t_exit and t_exit >= 0
+
     def get_stats(self):
         """Return summary statistics."""
-        total = len(self.shots)
-        scored = sum(1 for s in self.shots if s.result == "scored")
-        missed = sum(1 for s in self.shots if s.result == "missed")
-        in_flight = len(self.active_shots)
+        # Separate shots vs field passes
+        shots_only = [s for s in self.shots if s.classification == "shot"]
+        field_passes = [s for s in self.shots if s.classification == "field_pass"]
+
+        total = len(shots_only)
+        scored = sum(1 for s in shots_only if s.result == "scored")
+        missed = sum(1 for s in shots_only if s.result == "missed")
+        in_flight = sum(1 for s in self.active_shots.values() if s.classification == "shot")
         unresolved = total - scored - missed
 
+        # By-robot breakdown (shots only, not field passes)
         by_robot = defaultdict(lambda: {"scored": 0, "missed": 0, "total": 0})
-        for shot in self.shots:
+        for shot in shots_only:
             r = shot.robot_name
             by_robot[r]["total"] += 1
             if shot.result == "scored":
@@ -262,6 +591,7 @@ class ShotDetector:
             "shots_missed": missed,
             "shots_in_flight": in_flight,
             "shots_unresolved": unresolved,
+            "field_passes": len(field_passes),
             "by_robot": dict(by_robot),
         }
 
@@ -269,16 +599,18 @@ class ShotDetector:
         """Export shot log to CSV."""
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["shot_id", "robot", "launch_frame", "launch_x",
+            writer.writerow(["shot_id", "classification", "robot", "launch_frame", "launch_x",
                              "launch_y", "result", "result_frame", "goal_name"])
             for shot in self.shots:
                 writer.writerow([
-                    shot.shot_id, shot.robot_name, shot.launch_frame,
+                    shot.shot_id, shot.classification, shot.robot_name, shot.launch_frame,
                     f"{shot.launch_x:.0f}", f"{shot.launch_y:.0f}",
                     shot.result or "in_flight", shot.result_frame or "",
                     shot.goal_name or "",
                 ])
-        print(f"[CSV] Exported {len(self.shots)} shots to {path}")
+        print(f"[CSV] Exported {len(self.shots)} events to {path} "
+              f"({sum(1 for s in self.shots if s.classification == 'shot')} shots, "
+              f"{sum(1 for s in self.shots if s.classification == 'field_pass')} field passes)")
 
 
 class ShotEvent:
@@ -290,16 +622,22 @@ class ShotEvent:
         This ensures that if the ball passes through another robot's zone
         after being launched, it remains correctly attributed to the robot
         that actually made the shot.
+
+    CLASSIFICATION:
+        - "shot": Ball aimed at a goal region (green tracer)
+        - "field_pass": Ball thrown fast but NOT aimed at goal (cyan tracer)
+        - "ignored": Slow bounces, ejector dribbles (no tracer)
     """
 
     def __init__(self, shot_id, obj_id, launch_x, launch_y, launch_frame,
-                 robot_name="unknown"):
+                 robot_name="unknown", classification="shot"):
         self.shot_id = shot_id
         self.obj_id = obj_id
         self.launch_x = launch_x
         self.launch_y = launch_y
         self.launch_frame = launch_frame
         self.robot_name = robot_name
+        self.classification = classification  # "shot", "field_pass", or "ignored"
 
         self.positions = [(launch_x, launch_y, launch_frame)]
         self.result = None       # 'scored' or 'missed'
@@ -479,8 +817,12 @@ def draw_shots(frame, shot_detector, tracked_objects, config):
         if obj_id in shot_detector.active_shots:
             shot = shot_detector.active_shots[obj_id]
 
-        # Color based on shot status
-        if shot and shot.result == "scored":
+        # Color based on shot status and classification
+        is_field_pass = shot and shot.classification == "field_pass"
+
+        if is_field_pass:
+            color = (255, 255, 0)     # Cyan = field pass
+        elif shot and shot.result == "scored":
             color = (0, 255, 0)       # Green = scored
         elif shot and shot.result == "missed":
             color = (0, 0, 255)       # Red = missed
@@ -504,12 +846,22 @@ def draw_shots(frame, shot_detector, tracked_objects, config):
         # Ball
         cv2.circle(annotated, (cx, cy), int(obj.radius), color, 2)
 
+        # Draw origin marker (star) for "unknown" attributed shots
+        if shot and shot.robot_name == "unknown" and not is_field_pass:
+            origin_x, origin_y = int(shot.launch_x), int(shot.launch_y)
+            cv2.drawMarker(annotated, (origin_x, origin_y),
+                           (0, 255, 255),  # Yellow marker
+                           cv2.MARKER_STAR, 15, 2)
+
         # Label
         if shot:
-            label = f"S{shot.shot_id}"
+            if is_field_pass:
+                label = f"P{shot.shot_id}"  # P for pass
+            else:
+                label = f"S{shot.shot_id}"
             if shot.robot_name != "unknown":
                 label += f":{shot.robot_name}"
-            if shot.result:
+            if shot.result and not is_field_pass:
                 label += f" [{shot.result.upper()}]"
             cv2.putText(annotated, label, (cx + 8, cy - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
@@ -585,8 +937,8 @@ def main():
     playback_delay = int(1000 / vid_info["fps"])
     frame_num = 0
 
-    print("\nControls: SPACE=play/pause  g=rect goals  G=poly goals  "
-          "z=robots  s=save  e=export CSV  q=quit\n")
+    print("\nControls: SPACE=play/pause  g=rect goals  G=poly goals  z=robots")
+    print("          h=rect HP zone  H=poly HP zone  s=save  e=export CSV  q=quit\n")
 
     while True:
         if playing:
@@ -638,6 +990,28 @@ def main():
                     config.get("robot_zones", {}).get("robots", [])
                 )
                 config["robot_zones"]["robots"] = robots
+                shot_detector = ShotDetector(config, robot_detector=robot_detector)
+                continue
+            elif key == ord('h'):
+                # Rectangle human player zone
+                roi_frame = apply_roi(frame, config["roi"])
+                hp_zones = select_zones_on_frame(
+                    roi_frame, "human_player",
+                    config.get("human_player_zones", {}).get("zones", [])
+                )
+                config.setdefault("human_player_zones", {})["zones"] = hp_zones
+                config["human_player_zones"]["enabled"] = True
+                shot_detector = ShotDetector(config, robot_detector=robot_detector)
+                continue
+            elif key == ord('H'):
+                # Polygon human player zone
+                roi_frame = apply_roi(frame, config["roi"])
+                hp_zones = select_polygon_zone(
+                    roi_frame, "human_player",
+                    config.get("human_player_zones", {}).get("zones", [])
+                )
+                config.setdefault("human_player_zones", {})["zones"] = hp_zones
+                config["human_player_zones"]["enabled"] = True
                 shot_detector = ShotDetector(config, robot_detector=robot_detector)
                 continue
             elif key == ord('s'):
@@ -706,15 +1080,16 @@ def main():
     print("\n" + "=" * 60)
     print("  SHOT DETECTION SUMMARY")
     print("=" * 60)
-    print(f"  Total shots detected: {final['shots_total']}")
+    print(f"  Total shots on goal:  {final['shots_total']}")
     print(f"  Scored:               {final['shots_scored']}")
     print(f"  Missed:               {final['shots_missed']}")
     print(f"  Unresolved:           {final['shots_unresolved']}")
+    print(f"  Field passes:         {final.get('field_passes', 0)}")
     if final["by_robot"]:
-        print(f"\n  By Robot:")
-        for robot, stats in final["by_robot"].items():
-            print(f"    {robot}: {stats['total']} shots "
-                  f"({stats['scored']} scored, {stats['missed']} missed)")
+        print(f"\n  By Robot (shots only):")
+        for robot, robot_stats in final["by_robot"].items():
+            pct = (robot_stats['scored'] / robot_stats['total'] * 100) if robot_stats['total'] > 0 else 0
+            print(f"    {robot}: {robot_stats['scored']}/{robot_stats['total']} ({pct:.0f}%)")
     print("=" * 60)
 
     # Auto-export

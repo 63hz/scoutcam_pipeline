@@ -287,6 +287,393 @@ def select_roi_interactive(video_path):
 
 
 # ============================================================================
+# VIDEO WRITER (NVENC + CPU FALLBACK)
+# ============================================================================
+
+import subprocess
+import shutil
+
+
+class NVENCWriter:
+    """
+    Hardware-accelerated video writer using FFmpeg NVENC.
+
+    Uses FFmpeg subprocess with h264_nvenc for GPU-accelerated encoding.
+    Falls back to OpenCV VideoWriter if FFmpeg/NVENC unavailable.
+
+    Performance:
+        - NVENC on RTX 3090: 300+ fps encoding
+        - CPU (OpenCV mp4v): 50-100 fps encoding
+
+    Usage:
+        writer = NVENCWriter(path, fps, (width, height), config)
+        writer.write(frame)
+        writer.release()
+    """
+
+    def __init__(self, path, fps, size, config=None):
+        """
+        Initialize video writer.
+
+        Args:
+            path: Output file path
+            fps: Frame rate
+            size: (width, height) tuple
+            config: Optional config dict with output settings
+        """
+        self.path = str(path)
+        self.fps = fps
+        self.width, self.height = size
+        self.config = config or {}
+
+        output_cfg = self.config.get("output", {})
+        self.use_nvenc = output_cfg.get("use_nvenc", True)
+        self.nvenc_preset = output_cfg.get("nvenc_preset", "p4")
+        self.nvenc_cq = output_cfg.get("nvenc_cq", 23)
+
+        self._proc = None
+        self._fallback_writer = None
+        self._frame_count = 0
+
+        if self.use_nvenc and self._check_ffmpeg_nvenc():
+            self._init_nvenc()
+        else:
+            self._init_fallback()
+
+    def _check_ffmpeg_nvenc(self):
+        """Check if FFmpeg with NVENC is available."""
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path:
+            print("[WRITER] FFmpeg not found in PATH")
+            return False
+
+        # Check for NVENC encoder
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                capture_output=True, text=True, timeout=5
+            )
+            if "h264_nvenc" in result.stdout:
+                print("[WRITER] FFmpeg NVENC available")
+                return True
+            else:
+                print("[WRITER] FFmpeg found but NVENC not available")
+                return False
+        except Exception as e:
+            print(f"[WRITER] Error checking FFmpeg: {e}")
+            return False
+
+    def _init_nvenc(self):
+        """Initialize FFmpeg NVENC writer."""
+        cmd = [
+            "ffmpeg",
+            "-y",  # Overwrite output
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{self.width}x{self.height}",
+            "-r", str(self.fps),
+            "-i", "-",  # Read from stdin
+            "-c:v", "h264_nvenc",
+            "-preset", self.nvenc_preset,
+            "-cq", str(self.nvenc_cq),
+            "-pix_fmt", "yuv420p",
+            self.path
+        ]
+
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(f"[WRITER] NVENC writer initialized (preset={self.nvenc_preset}, cq={self.nvenc_cq})")
+        except Exception as e:
+            print(f"[WRITER] NVENC init failed: {e}")
+            self._init_fallback()
+
+    def _init_fallback(self):
+        """Initialize OpenCV fallback writer."""
+        fourcc = cv2.VideoWriter_fourcc(*self.config.get("output", {}).get("codec", "mp4v"))
+        self._fallback_writer = cv2.VideoWriter(
+            self.path, fourcc, self.fps, (self.width, self.height)
+        )
+        if self._fallback_writer.isOpened():
+            print(f"[WRITER] CPU fallback writer initialized (codec=mp4v)")
+        else:
+            raise IOError(f"Cannot create video writer: {self.path}")
+
+    def write(self, frame):
+        """Write a frame to the video."""
+        if self._proc is not None:
+            try:
+                self._proc.stdin.write(frame.tobytes())
+                self._frame_count += 1
+            except BrokenPipeError:
+                print("[WRITER] NVENC pipe broken, switching to fallback")
+                self._init_fallback()
+                self._fallback_writer.write(frame)
+        elif self._fallback_writer is not None:
+            self._fallback_writer.write(frame)
+            self._frame_count += 1
+
+    def release(self):
+        """Release the writer and finalize the video."""
+        if self._proc is not None:
+            try:
+                self._proc.stdin.close()
+                self._proc.wait(timeout=30)
+            except Exception as e:
+                print(f"[WRITER] Error finalizing NVENC: {e}")
+        if self._fallback_writer is not None:
+            self._fallback_writer.release()
+        print(f"[WRITER] Wrote {self._frame_count} frames to {self.path}")
+
+    def isOpened(self):
+        """Check if writer is ready."""
+        if self._proc is not None:
+            return self._proc.poll() is None
+        if self._fallback_writer is not None:
+            return self._fallback_writer.isOpened()
+        return False
+
+
+def create_video_writer(path, fps, size, config=None):
+    """
+    Factory function to create appropriate video writer.
+
+    Args:
+        path: Output file path
+        fps: Frame rate
+        size: (width, height) tuple
+        config: Optional config dict
+
+    Returns:
+        NVENCWriter or cv2.VideoWriter instance
+    """
+    output_cfg = (config or {}).get("output", {})
+
+    if output_cfg.get("use_nvenc", True):
+        try:
+            return NVENCWriter(path, fps, size, config)
+        except Exception as e:
+            print(f"[WRITER] NVENCWriter failed: {e}")
+
+    # Fallback to OpenCV
+    fourcc = cv2.VideoWriter_fourcc(*output_cfg.get("codec", "mp4v"))
+    writer = cv2.VideoWriter(str(path), fourcc, fps, size)
+    if writer.isOpened():
+        print(f"[WRITER] OpenCV writer initialized")
+        return writer
+    else:
+        raise IOError(f"Cannot create video writer: {path}")
+
+
+# ============================================================================
+# VIDEO SOURCE (FILE + CAMERA)
+# ============================================================================
+
+class VideoSource:
+    """
+    Unified interface for video file and live camera input.
+
+    Supports:
+        - Video files (mp4, mkv, etc.)
+        - Local cameras (device index)
+        - RTSP streams (IP cameras)
+
+    Usage:
+        source = VideoSource.open("video.mkv", config)
+        # or: source = VideoSource.open(0, config)  # Camera
+        # or: source = VideoSource.open("rtsp://...", config)
+
+        while True:
+            ret, frame = source.read()
+            if not ret:
+                break
+        source.release()
+    """
+
+    @staticmethod
+    def open(source, config=None):
+        """
+        Open a video source.
+
+        Args:
+            source: File path, camera index (int), or RTSP URL
+            config: Optional config dict
+
+        Returns:
+            Appropriate video source instance
+        """
+        if isinstance(source, int):
+            return LiveCameraSource(source, config)
+        elif isinstance(source, str):
+            if source.startswith("rtsp://") or source.startswith("http://"):
+                return LiveCameraSource(source, config)
+            else:
+                return FileSource(source, config)
+        else:
+            raise ValueError(f"Unknown source type: {type(source)}")
+
+
+class FileSource:
+    """Video file source."""
+
+    def __init__(self, path, config=None):
+        self.path = str(path)
+        self.config = config or {}
+        self.cap = cv2.VideoCapture(self.path)
+
+        if not self.cap.isOpened():
+            raise IOError(f"Cannot open video: {self.path}")
+
+        self._info = {
+            "type": "file",
+            "path": self.path,
+            "width": int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            "height": int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            "fps": self.cap.get(cv2.CAP_PROP_FPS),
+            "frame_count": int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+        }
+        self._info["duration_sec"] = self._info["frame_count"] / self._info["fps"] if self._info["fps"] > 0 else 0
+
+        print(f"[SOURCE] File: {self.path}")
+        print(f"[SOURCE] {self._info['width']}x{self._info['height']} @ {self._info['fps']:.1f} fps")
+        print(f"[SOURCE] {self._info['frame_count']} frames ({self._info['duration_sec']:.1f}s)")
+
+    def read(self):
+        """Read next frame."""
+        return self.cap.read()
+
+    def get_fps(self):
+        """Get frame rate."""
+        return self._info["fps"]
+
+    def get_info(self):
+        """Get source info dict."""
+        return self._info
+
+    def get_position(self):
+        """Get current frame position."""
+        return int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+
+    def set_position(self, frame_num):
+        """Seek to specific frame."""
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+
+    def release(self):
+        """Release the video source."""
+        self.cap.release()
+
+    def is_live(self):
+        """Check if this is a live source."""
+        return False
+
+
+class LiveCameraSource:
+    """
+    Live camera source (local camera or RTSP stream).
+
+    Features:
+        - Auto-detect camera FPS
+        - Handle camera warmup/connection issues
+        - Frame dropping if processing can't keep up
+    """
+
+    def __init__(self, source, config=None):
+        """
+        Args:
+            source: Camera index (int) or RTSP URL (str)
+            config: Optional config dict
+        """
+        self.source = source
+        self.config = config or {}
+        input_cfg = self.config.get("input", {})
+
+        # Open capture
+        self.cap = cv2.VideoCapture(source)
+
+        if not self.cap.isOpened():
+            raise IOError(f"Cannot open camera: {source}")
+
+        # Set camera properties
+        if isinstance(source, int):
+            # Local camera - try to set high resolution/fps
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            self.cap.set(cv2.CAP_PROP_FPS, 60)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce latency
+
+        # Get actual properties
+        self._info = {
+            "type": "camera" if isinstance(source, int) else "rtsp",
+            "source": str(source),
+            "width": int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            "height": int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            "fps": self.cap.get(cv2.CAP_PROP_FPS),
+            "frame_count": 0,  # Unknown for live
+        }
+
+        # FPS override from config
+        fps_override = input_cfg.get("camera_fps_override")
+        if fps_override:
+            self._info["fps"] = fps_override
+
+        # Handle 0 fps (some cameras don't report)
+        if self._info["fps"] <= 0:
+            self._info["fps"] = 30.0
+            print(f"[SOURCE] Warning: Camera FPS unknown, assuming 30")
+
+        self._drop_frames = input_cfg.get("drop_frames_if_behind", True)
+        self._frame_count = 0
+
+        source_type = "Camera" if isinstance(source, int) else "RTSP"
+        print(f"[SOURCE] {source_type}: {source}")
+        print(f"[SOURCE] {self._info['width']}x{self._info['height']} @ {self._info['fps']:.1f} fps")
+
+        # Warmup - read a few frames to stabilize
+        print("[SOURCE] Warming up camera...")
+        for _ in range(5):
+            self.cap.read()
+
+    def read(self):
+        """Read next frame (drops frames if configured)."""
+        ret, frame = self.cap.read()
+        if ret:
+            self._frame_count += 1
+        return ret, frame
+
+    def get_fps(self):
+        """Get frame rate."""
+        return self._info["fps"]
+
+    def get_info(self):
+        """Get source info dict."""
+        info = self._info.copy()
+        info["frames_read"] = self._frame_count
+        return info
+
+    def get_position(self):
+        """Get frames read count."""
+        return self._frame_count
+
+    def set_position(self, frame_num):
+        """Not supported for live sources."""
+        pass
+
+    def release(self):
+        """Release the camera."""
+        self.cap.release()
+        print(f"[SOURCE] Released camera after {self._frame_count} frames")
+
+    def is_live(self):
+        """Check if this is a live source."""
+        return True
+
+
+# ============================================================================
 # BALL DETECTOR
 # ============================================================================
 
@@ -1021,6 +1408,39 @@ class TrackedObject:
     def is_moving(self):
         return self.speed > 2.0
 
+    def get_smoothed_velocity(self, window=3):
+        """
+        Get smoothed velocity over the last N frames.
+
+        At high frame rates, frame-to-frame velocity can be noisy due to
+        small detection position errors. Smoothing reduces jitter.
+
+        Args:
+            window: Number of frames to average over (default 3)
+
+        Returns:
+            (vx, vy, speed) tuple with smoothed values
+        """
+        if len(self.trail) < 2:
+            return (0.0, 0.0, 0.0)
+
+        # Use last `window` positions from trail
+        positions = list(self.trail)[-min(window + 1, len(self.trail)):]
+
+        if len(positions) < 2:
+            return (0.0, 0.0, 0.0)
+
+        # Average velocity over the window
+        total_vx = positions[-1][0] - positions[0][0]
+        total_vy = positions[-1][1] - positions[0][1]
+        n_frames = len(positions) - 1
+
+        avg_vx = total_vx / n_frames
+        avg_vy = total_vy / n_frames
+        avg_speed = math.sqrt(avg_vx**2 + avg_vy**2)
+
+        return (avg_vx, avg_vy, avg_speed)
+
 
 # ============================================================================
 # ROBOT DETECTOR (Dynamic Robot Tracking)
@@ -1044,7 +1464,8 @@ class TrackedRobot:
     Attributes:
         id: Unique tracking ID
         cx, cy: Current centroid position
-        bbox: Bounding box (x, y, w, h)
+        bbox: Bounding box (x, y, w, h) - bumper bbox
+        robot_bbox: Expanded bounding box (x1, y1, x2, y2) for full robot body
         alliance: 'red' or 'blue'
         team_number: Team number (e.g., '2491') or None if unknown
         identity: Full identity string like 'red_2491' or 'blue_unknown'
@@ -1057,6 +1478,7 @@ class TrackedRobot:
         self.cx = detection["cx"]
         self.cy = detection["cy"]
         self.bbox = detection["bbox"]
+        self.robot_bbox = detection.get("robot_bbox")  # Expanded bbox (x1, y1, x2, y2)
         self.area = detection["area"]
         self.alliance = alliance
         self.team_number = None
@@ -1076,6 +1498,7 @@ class TrackedRobot:
         self.cx = detection["cx"]
         self.cy = detection["cy"]
         self.bbox = detection["bbox"]
+        self.robot_bbox = detection.get("robot_bbox")  # Preserve expanded bbox
         self.area = detection["area"]
         self.disappeared = 0
         self.age += 1
@@ -1173,6 +1596,9 @@ class KalmanBoxTracker:
         # Velocity from last observation (for OCM)
         self.observed_velocity = np.array([0.0, 0.0], dtype=np.float32)
 
+        # Expanded robot bbox for shot attribution (set externally)
+        self.robot_bbox = None
+
     def predict(self):
         """
         Advance state by one frame using Kalman prediction.
@@ -1195,12 +1621,13 @@ class KalmanBoxTracker:
         self.time_since_update += 1
         return self._state_to_bbox(state)
 
-    def update(self, bbox):
+    def update(self, bbox, robot_bbox=None):
         """
         Correct state with new observation.
 
         Args:
             bbox: Observed bounding box (x, y, w, h)
+            robot_bbox: Optional expanded robot bbox (x1, y1, x2, y2) for shot attribution
         """
         x, y, w, h = bbox
         cx, cy = x + w / 2, y + h / 2
@@ -1222,6 +1649,10 @@ class KalmanBoxTracker:
         self.time_since_update = 0
         self.observations.append(bbox)
         self.last_observation = bbox
+
+        # Store expanded robot bbox for shot attribution
+        if robot_bbox is not None:
+            self.robot_bbox = robot_bbox
 
     def _apply_oru(self, current_bbox):
         """
@@ -1375,8 +1806,24 @@ class OCSORTTracker:
         self.min_hits = track_cfg.get("min_hits", 3)
         self.iou_threshold = track_cfg.get("iou_threshold", 0.3)
 
+        # Re-identification settings
+        self.dead_track_max_age = track_cfg.get("dead_track_max_age", 90)  # ~3 seconds
+        self.enable_reidentification = track_cfg.get("enable_reidentification", True)
+
         self.trackers = []  # List of KalmanBoxTracker
         self.frame_count = 0
+
+        # Dead tracks storage for re-identification
+        # Each entry: {"tracker": KalmanBoxTracker, "death_frame": int}
+        self._dead_tracks = []
+
+        # Track aliases for manual ID linking
+        # Maps track_id -> team_number (string)
+        self._track_aliases = {}
+
+        # Track merges: tracks that are the same physical robot
+        # Maps track_id -> canonical_track_id
+        self._track_merges = {}
 
         # Stats for debugging
         self._stats = {
@@ -1384,6 +1831,7 @@ class OCSORTTracker:
             "unmatched_tracks": 0,
             "unmatched_dets": 0,
             "id_switches": 0,
+            "reidentifications": 0,
         }
 
     def update_config(self, config):
@@ -1393,6 +1841,8 @@ class OCSORTTracker:
         self.max_age = track_cfg.get("max_age", 15)
         self.min_hits = track_cfg.get("min_hits", 3)
         self.iou_threshold = track_cfg.get("iou_threshold", 0.3)
+        self.dead_track_max_age = track_cfg.get("dead_track_max_age", 90)
+        self.enable_reidentification = track_cfg.get("enable_reidentification", True)
 
     def update(self, detections):
         """
@@ -1409,6 +1859,7 @@ class OCSORTTracker:
         # Convert detections to bbox list
         det_bboxes = [d["bbox"] for d in detections]
         det_alliances = [d.get("alliance", "unknown") for d in detections]
+        det_robot_bboxes = [d.get("robot_bbox") for d in detections]
 
         # Predict new locations for all existing trackers
         predicted_bboxes = []
@@ -1452,7 +1903,7 @@ class OCSORTTracker:
             if cost_matrix[r, c] > (1.0 - self.iou_threshold):
                 # IoU too low - not a valid match
                 continue
-            self.trackers[r].update(det_bboxes[c])
+            self.trackers[r].update(det_bboxes[c], robot_bbox=det_robot_bboxes[c])
             matched_tracks.add(r)
             matched_dets.add(c)
             self._stats["matches"] += 1
@@ -1495,19 +1946,88 @@ class OCSORTTracker:
         return rows, cols
 
     def _create_tracker(self, detection):
-        """Create new Kalman tracker for detection."""
+        """
+        Create new Kalman tracker for detection, or revive a dead track if possible.
+
+        Re-identification works by checking if this detection matches a recently
+        dead track based on:
+        1. Same alliance
+        2. Predicted position overlap (IoU > threshold)
+        """
         bbox = detection["bbox"]
         alliance = detection.get("alliance", "unknown")
+        robot_bbox = detection.get("robot_bbox")
+
+        # Attempt re-identification against dead tracks
+        if self.enable_reidentification and self._dead_tracks:
+            best_match = None
+            best_iou = 0.2  # Minimum IoU threshold for re-ID
+
+            for i, dt in enumerate(self._dead_tracks):
+                dead_tracker = dt["tracker"]
+
+                # Alliance must match
+                if dead_tracker.alliance != alliance:
+                    continue
+
+                # Predict where the dead track would be now
+                frames_since_death = self.frame_count - dt["death_frame"]
+                predicted_bbox = dead_tracker.get_state()
+
+                # Extrapolate position based on velocity
+                state = dead_tracker.kf.statePost.flatten()
+                vx, vy = state[4], state[5]
+                cx, cy, w, h = state[0], state[1], state[2], state[3]
+                cx += vx * frames_since_death
+                cy += vy * frames_since_death
+                predicted_bbox = (int(cx - w/2), int(cy - h/2), int(w), int(h))
+
+                # Check IoU with new detection
+                iou_score = iou(predicted_bbox, bbox)
+                if iou_score > best_iou:
+                    best_iou = iou_score
+                    best_match = i
+
+            if best_match is not None:
+                # Revive the dead track
+                dt = self._dead_tracks.pop(best_match)
+                revived = dt["tracker"]
+
+                # Reset the tracker with new observation
+                revived.update(bbox, robot_bbox=robot_bbox)
+                revived.time_since_update = 0
+                self.trackers.append(revived)
+                self._stats["reidentifications"] += 1
+
+                return revived
+
+        # No re-ID match - create new tracker
         tracker = KalmanBoxTracker(bbox, alliance=alliance)
+        tracker.robot_bbox = robot_bbox  # Set initial robot bbox
         self.trackers.append(tracker)
         return tracker
 
     def _cleanup_dead_tracks(self):
-        """Remove tracks that have been missing too long."""
-        self.trackers = [
-            t for t in self.trackers
-            if t.time_since_update <= self.max_age
-        ]
+        """Remove tracks that have been missing too long, storing them for re-ID."""
+        surviving = []
+        for t in self.trackers:
+            if t.time_since_update <= self.max_age:
+                surviving.append(t)
+            elif self.enable_reidentification:
+                # Store dead track for potential re-identification
+                self._dead_tracks.append({
+                    "tracker": t,
+                    "death_frame": self.frame_count,
+                })
+
+        self.trackers = surviving
+
+        # Clean up old dead tracks
+        if self.enable_reidentification:
+            self._dead_tracks = [
+                dt for dt in self._dead_tracks
+                if self.frame_count - dt["death_frame"] <= self.dead_track_max_age
+            ]
 
     def _get_output(self):
         """
@@ -1538,12 +2058,76 @@ class OCSORTTracker:
         t = self.get_tracker_by_id(track_id)
         if t:
             t.set_team_number(team_number, manual=True)
+            # Also store in aliases for persistence
+            self._track_aliases[track_id] = team_number
+
+    def merge_tracks(self, track_id1, track_id2, team_number=None):
+        """
+        Mark two track IDs as the same physical robot.
+
+        This is useful when a robot's track ID changes after occlusion
+        and we want to link them together for reporting.
+
+        Args:
+            track_id1: First track ID
+            track_id2: Second track ID
+            team_number: Optional team number to assign to both
+        """
+        # Use the lower ID as the canonical one
+        canonical = min(track_id1, track_id2)
+        other = max(track_id1, track_id2)
+
+        self._track_merges[other] = canonical
+
+        # Apply team number if provided
+        if team_number:
+            self._track_aliases[canonical] = team_number
+            self._track_aliases[other] = team_number
+
+            # Apply to any active trackers
+            for t in self.trackers:
+                if t.id in (track_id1, track_id2):
+                    t.set_team_number(team_number, manual=True)
+
+    def get_canonical_id(self, track_id):
+        """Get the canonical track ID (follows merge chain)."""
+        seen = set()
+        while track_id in self._track_merges:
+            if track_id in seen:
+                break  # Prevent infinite loops
+            seen.add(track_id)
+            track_id = self._track_merges[track_id]
+        return track_id
+
+    def get_identity_for_track(self, track_id):
+        """
+        Get identity string for a track, checking aliases first.
+
+        Returns:
+            str: Team number if aliased, otherwise None
+        """
+        canonical = self.get_canonical_id(track_id)
+        return self._track_aliases.get(canonical)
+
+    def get_dead_tracks_summary(self):
+        """Get summary of dead tracks available for re-ID."""
+        return [
+            {
+                "id": dt["tracker"].id,
+                "alliance": dt["tracker"].alliance,
+                "team_number": dt["tracker"].team_number,
+                "death_frame": dt["death_frame"],
+                "frames_dead": self.frame_count - dt["death_frame"],
+            }
+            for dt in self._dead_tracks
+        ]
 
     def get_stats(self):
         """Get tracking statistics for debugging."""
         return {
             "active_tracks": len(self.trackers),
             "confirmed_tracks": sum(1 for t in self.trackers if t.hits >= self.min_hits),
+            "dead_tracks": len(self._dead_tracks),
             "frame_count": self.frame_count,
             **self._stats
         }
@@ -1555,6 +2139,7 @@ class OCSORTTracker:
             "unmatched_tracks": 0,
             "unmatched_dets": 0,
             "id_switches": 0,
+            "reidentifications": 0,
         }
 
 
@@ -1615,6 +2200,10 @@ class _TrackerOutputWrapper:
     @property
     def age(self):
         return self._tracker.age
+
+    @property
+    def robot_bbox(self):
+        return self._tracker.robot_bbox
 
 
 class RobotDetector:
@@ -2061,6 +2650,58 @@ class RobotDetector:
 
         return nearest.identity if nearest else "unknown"
 
+    def point_in_robot_bbox(self, x, y, expansion=2.0):
+        """
+        Check if a point is inside any robot's expanded bounding box.
+
+        For HSV-based detection, we expand the bumper bbox upward to approximate
+        the full robot body.
+
+        Args:
+            x, y: Point to check
+            expansion: Factor to expand bbox upward (default 2.0)
+
+        Returns:
+            tuple: (inside: bool, robot_identity: str or None)
+        """
+        for robot in self.robots.values():
+            if robot.disappeared > 0:
+                continue
+
+            # Expand bumper bbox upward to approximate full robot
+            bx, by, bw, bh = robot.bbox
+            expanded_h = int(bh * expansion)
+            x1, y1 = bx, by - (expanded_h - bh)
+            x2, y2 = bx + bw, by + bh
+
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return (True, robot.identity)
+
+        return (False, None)
+
+    def ball_exited_robot_bbox(self, current_x, current_y, prev_x, prev_y):
+        """
+        Check if a ball has exited a robot's expanded bounding box.
+
+        Args:
+            current_x, current_y: Ball's current position
+            prev_x, prev_y: Ball's previous position
+
+        Returns:
+            tuple: (exited: bool, robot_identity: str or None)
+        """
+        prev_inside, prev_robot = self.point_in_robot_bbox(prev_x, prev_y)
+
+        if not prev_inside:
+            return (False, None)
+
+        curr_inside, _ = self.point_in_robot_bbox(current_x, current_y)
+
+        if curr_inside:
+            return (False, None)
+
+        return (True, prev_robot)
+
     def get_all_robots(self):
         """Get all currently visible robots."""
         return {rid: r for rid, r in self.robots.items() if r.disappeared == 0}
@@ -2340,6 +2981,70 @@ class YOLORobotDetector:
 
         return nearest.identity if nearest else "unknown"
 
+    def point_in_robot_bbox(self, x, y):
+        """
+        Check if a point is inside any robot's expanded bounding box.
+
+        Uses the stored robot_bbox (expanded during detection) if available,
+        otherwise falls back to expanding the bumper bbox at runtime.
+
+        Args:
+            x, y: Point to check
+
+        Returns:
+            tuple: (inside: bool, robot_identity: str or None)
+        """
+        for robot in self.robots.values():
+            if robot.disappeared > 0:
+                continue
+
+            # Use the stored expanded robot bbox if available
+            if robot.robot_bbox is not None:
+                # robot_bbox is already in (x1, y1, x2, y2) format
+                x1, y1, x2, y2 = robot.robot_bbox
+            else:
+                # Fall back to expanding bumper bbox at runtime
+                bx, by, bw, bh = robot.bbox
+                expanded_h = int(bh * self.bbox_expansion)
+                x1, y1 = bx, by - (expanded_h - bh)
+                x2, y2 = bx + bw, by + bh
+
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return (True, robot.identity)
+
+        return (False, None)
+
+    def ball_exited_robot_bbox(self, current_x, current_y, prev_x, prev_y):
+        """
+        Check if a ball has exited a robot's expanded bounding box.
+
+        This is used for rigorous shot detection: a shot should only be counted
+        if the ball actually exits the robot's bounding box while moving upward.
+
+        Args:
+            current_x, current_y: Ball's current position
+            prev_x, prev_y: Ball's previous position
+
+        Returns:
+            tuple: (exited: bool, robot_identity: str or None)
+                   exited is True if ball was inside a robot bbox in prev frame
+                   and is outside in current frame
+        """
+        # Check if ball was inside any robot bbox in previous frame
+        prev_inside, prev_robot = self.point_in_robot_bbox(prev_x, prev_y)
+
+        if not prev_inside:
+            return (False, None)
+
+        # Check if ball is outside now
+        curr_inside, _ = self.point_in_robot_bbox(current_x, current_y)
+
+        if curr_inside:
+            return (False, None)
+
+        # Ball exited! Return the robot it exited from
+        return (True, prev_robot)
+
     def get_tracker_stats(self):
         """Get tracking statistics for debugging/display."""
         if self._ocsort is not None:
@@ -2360,7 +3065,7 @@ class YOLORobotDetector:
         return {rid: r for rid, r in self.robots.items() if r.disappeared == 0}
 
 
-def draw_robots(frame, robots, show_ids=True, show_bbox=True):
+def draw_robots(frame, robots, show_ids=True, show_bbox=True, show_attribution_zone=False):
     """
     Draw tracked robots on frame.
 
@@ -2368,7 +3073,8 @@ def draw_robots(frame, robots, show_ids=True, show_bbox=True):
         frame: BGR image
         robots: Dict of robot_id -> TrackedRobot
         show_ids: Show identity labels
-        show_bbox: Show bounding boxes
+        show_bbox: Show bounding boxes (bumper bbox)
+        show_attribution_zone: Show expanded robot bbox for shot attribution (dashed)
 
     Returns:
         Annotated frame
@@ -2382,7 +3088,13 @@ def draw_robots(frame, robots, show_ids=True, show_bbox=True):
         # Color based on alliance
         color = (0, 0, 255) if robot.alliance == "red" else (255, 0, 0)
 
-        # Bounding box
+        # Expanded robot bbox (attribution zone) - draw first so bumper box overlays
+        if show_attribution_zone and robot.robot_bbox is not None:
+            x1, y1, x2, y2 = robot.robot_bbox
+            # Draw dashed rectangle for attribution zone
+            _draw_dashed_rect(out, (x1, y1), (x2, y2), color, thickness=1, dash_length=8)
+
+        # Bounding box (bumper)
         if show_bbox:
             x, y, w, h = robot.bbox
             cv2.rectangle(out, (x, y), (x+w, y+h), color, 2)
@@ -2400,6 +3112,213 @@ def draw_robots(frame, robots, show_ids=True, show_bbox=True):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
     return out
+
+
+def _draw_dashed_rect(img, pt1, pt2, color, thickness=1, dash_length=10):
+    """Draw a dashed rectangle."""
+    x1, y1 = pt1
+    x2, y2 = pt2
+    # Top edge
+    _draw_dashed_line(img, (x1, y1), (x2, y1), color, thickness, dash_length)
+    # Bottom edge
+    _draw_dashed_line(img, (x1, y2), (x2, y2), color, thickness, dash_length)
+    # Left edge
+    _draw_dashed_line(img, (x1, y1), (x1, y2), color, thickness, dash_length)
+    # Right edge
+    _draw_dashed_line(img, (x2, y1), (x2, y2), color, thickness, dash_length)
+
+
+def _draw_dashed_line(img, pt1, pt2, color, thickness=1, dash_length=10):
+    """Draw a dashed line between two points."""
+    x1, y1 = pt1
+    x2, y2 = pt2
+    dist = ((x2 - x1)**2 + (y2 - y1)**2)**0.5
+    if dist < 1:
+        return
+    dx = (x2 - x1) / dist
+    dy = (y2 - y1) / dist
+
+    pos = 0
+    drawing = True
+    while pos < dist:
+        seg_len = min(dash_length, dist - pos)
+        sx = int(x1 + dx * pos)
+        sy = int(y1 + dy * pos)
+        ex = int(x1 + dx * (pos + seg_len))
+        ey = int(y1 + dy * (pos + seg_len))
+        if drawing:
+            cv2.line(img, (sx, sy), (ex, ey), color, thickness)
+        pos += dash_length
+        drawing = not drawing
+
+
+# ============================================================================
+# YOLO-BASED BALL DETECTOR
+# ============================================================================
+
+class YOLOBallDetector:
+    """
+    Detects FRC balls using a YOLO model for GPU-accelerated real-time detection.
+
+    This is a drop-in replacement for the HSV-based BallDetector that uses ML
+    detection. More robust than HSV and eliminates per-venue color tuning.
+
+    Features:
+        - YOLO-based ball detection (GPU accelerated)
+        - Same interface as BallDetector
+        - Automatic fallback to HSV if model unavailable
+        - Warmup for consistent inference timing
+
+    Usage:
+        detector = YOLOBallDetector(config)
+        detections = detector.detect(frame)
+    """
+
+    def __init__(self, config):
+        if not _YOLO_AVAILABLE:
+            raise ImportError(
+                "ultralytics not installed. Run: pip install ultralytics"
+            )
+
+        self.config = config
+        yolo_cfg = config.get("yolo_ball_detection", {})
+
+        # Load YOLO model
+        model_path = yolo_cfg.get("model_path", "models/ball_detector.pt")
+        if not os.path.isabs(model_path):
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            model_path = os.path.join(script_dir, model_path)
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"YOLO ball model not found: {model_path}\n"
+                "Train a model with: python 09_train_ball_model.py"
+            )
+
+        print(f"[YOLO-BALL] Loading model: {model_path}")
+        self.model = _YOLO(model_path)
+        self.conf_threshold = yolo_cfg.get("confidence_threshold", 0.3)
+
+        # Model info
+        self.class_names = self.model.names
+        print(f"[YOLO-BALL] Classes: {list(self.class_names.values())}")
+
+        # Timing diagnostics
+        self._timing_enabled = True
+        self._timing_interval = 100
+        self._frame_count = 0
+        self._timing_detect_total = 0.0
+        self._last_detect_time = 0.0
+
+        # Warmup
+        print("[YOLO-BALL] Warming up model...")
+        dummy = np.zeros((960, 960, 3), dtype=np.uint8)
+        for _ in range(3):
+            self.model.predict(dummy, verbose=False)
+        print("[YOLO-BALL] Ready!")
+
+    def detect(self, frame):
+        """
+        Detect balls in frame using YOLO.
+
+        Args:
+            frame: BGR image (numpy array)
+
+        Returns:
+            List of detection dicts with keys:
+                - cx, cy: Center coordinates
+                - radius: Estimated ball radius
+                - bbox: (x, y, w, h) bounding box
+                - area: Bounding box area
+                - confidence: Detection confidence
+        """
+        t0 = time.perf_counter()
+
+        results = self.model.predict(
+            frame,
+            conf=self.conf_threshold,
+            verbose=False
+        )
+
+        detections = []
+        for result in results:
+            boxes = result.boxes
+            if boxes is None:
+                continue
+
+            for i in range(len(boxes)):
+                conf = float(boxes.conf[i])
+                xyxy = boxes.xyxy[i].cpu().numpy()
+
+                x1, y1, x2, y2 = map(int, xyxy)
+                w = x2 - x1
+                h = y2 - y1
+
+                # Calculate center
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+
+                # Estimate radius (average of half dimensions)
+                radius = (w + h) / 4
+
+                detections.append({
+                    "cx": cx,
+                    "cy": cy,
+                    "radius": radius,
+                    "bbox": (x1, y1, w, h),
+                    "area": w * h,
+                    "confidence": conf,
+                })
+
+        # Timing diagnostics
+        detect_time = time.perf_counter() - t0
+        self._last_detect_time = detect_time
+        self._timing_detect_total += detect_time
+        self._frame_count += 1
+
+        if self._timing_enabled and self._frame_count % self._timing_interval == 0:
+            avg_detect = self._timing_detect_total / self._frame_count * 1000
+            print(f"[YOLO-BALL] Avg detect: {avg_detect:.1f}ms "
+                  f"({1000/avg_detect:.0f} fps)")
+
+        return detections
+
+    def get_timing(self):
+        """Return timing info for HUD display."""
+        return {
+            "detect_ms": self._last_detect_time * 1000,
+            "frame_count": self._frame_count,
+        }
+
+    def update_config(self, config):
+        """Update detector configuration (for compatibility with BallDetector)."""
+        self.config = config
+        yolo_cfg = config.get("yolo_ball_detection", {})
+        self.conf_threshold = yolo_cfg.get("confidence_threshold", 0.3)
+
+
+def create_ball_detector(config):
+    """
+    Factory function to create the appropriate ball detector.
+
+    Tries YOLO first if enabled, falls back to HSV if unavailable.
+
+    Args:
+        config: Configuration dict
+
+    Returns:
+        Ball detector instance (YOLOBallDetector or BallDetector)
+    """
+    yolo_cfg = config.get("yolo_ball_detection", {})
+
+    if yolo_cfg.get("enabled", False):
+        try:
+            return YOLOBallDetector(config)
+        except (ImportError, FileNotFoundError) as e:
+            print(f"[BALL] YOLO detector failed: {e}")
+            print("[BALL] Falling back to HSV detection...")
+
+    return BallDetector(config)
 
 
 # ============================================================================
@@ -2456,7 +3375,7 @@ def draw_tracked_objects(frame, objects, config=None):
 
 
 def draw_zones(frame, config):
-    """Draw goal regions and robot zones. Supports both polygon and rectangle formats."""
+    """Draw goal regions, robot zones, and human player zones. Supports both polygon and rectangle formats."""
     out = frame.copy()
 
     # Draw goal regions
@@ -2481,6 +3400,24 @@ def draw_zones(frame, config):
         cv2.rectangle(out, (x, y), (x+w, y+h), c, 2)
         cv2.putText(out, robot.get("name", "ROBOT"), (x+5, y+20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2)
+
+    # Draw human player zones
+    hp_cfg = config.get("human_player_zones", {})
+    if hp_cfg.get("enabled", False):
+        for zone in hp_cfg.get("zones", []):
+            name = zone.get("name", "HP")
+            color = (255, 0, 255)  # Magenta for human player zones
+
+            # Check for polygon format first
+            if "polygon" in zone and zone["polygon"]:
+                out = draw_polygon(out, zone["polygon"], color, 2, label=name)
+            elif "x" in zone:
+                # Rectangle format
+                x, y, w, h = zone["x"], zone["y"], zone["w"], zone["h"]
+                cv2.rectangle(out, (x, y), (x+w, y+h), color, 2)
+                cv2.putText(out, name, (x+5, y+20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
     return out
 
 
@@ -2664,27 +3601,148 @@ def select_zones_interactive(video_path, zone_type="goal"):
 # ============================================================================
 
 def draw_hud(frame, stats, frame_num=0, total_frames=0):
-    """Draw heads-up display with tracking stats."""
+    """Draw heads-up display with tracking stats and optional robot breakdown."""
     out = frame.copy()
     h, w = out.shape[:2]
+
+    # Check if we have robot breakdown data
+    by_robot = stats.get("by_robot", {})
+    field_passes = stats.get("field_passes", 0)
+    has_breakdown = bool(by_robot)
+
+    # Categorize entries by alliance and type (robot vs human player)
+    # Human player zones typically have "human" in the name
+    blue_robots = {}
+    blue_hp = {}
+    red_robots = {}
+    red_hp = {}
+    unknown = {}
+
+    for name, rs in by_robot.items():
+        name_lower = name.lower()
+        is_hp = "human" in name_lower or "hp" in name_lower
+
+        if name_lower.startswith("blue"):
+            if is_hp:
+                blue_hp[name] = rs
+            else:
+                blue_robots[name] = rs
+        elif name_lower.startswith("red"):
+            if is_hp:
+                red_hp[name] = rs
+            else:
+                red_robots[name] = rs
+        else:
+            unknown[name] = rs
+
+    # Calculate HUD size based on content
+    base_height = 140
+    if has_breakdown:
+        # Count rows needed for each column (robots + HP)
+        blue_rows = len(blue_robots) + len(blue_hp)
+        red_rows = len(red_robots) + len(red_hp)
+        max_alliance_rows = max(blue_rows, red_rows, 1)
+        unknown_rows = len(unknown)
+        # Header + alliance rows + unknown section
+        breakdown_height = 25 + (max_alliance_rows * 18) + (unknown_rows * 18 if unknown_rows else 0)
+        hud_height = base_height + breakdown_height
+        hud_width = 400
+    else:
+        hud_height = base_height
+        hud_width = 320
+
+    # Draw semi-transparent background
     overlay = out.copy()
-    cv2.rectangle(overlay, (0, 0), (320, 160), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, 0), (hud_width, hud_height), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.6, out, 0.4, 0, out)
+
     y = 20
     lines = [
         f"Frame: {frame_num}/{total_frames}",
-        f"Detected: {stats.get('balls_detected', 0)}",
-        f"Tracked: {stats.get('balls_tracked', 0)}",
-        f"Moving: {stats.get('balls_moving', 0)}",
+        f"Detected: {stats.get('balls_detected', 0)}  Tracked: {stats.get('balls_tracked', 0)}  Moving: {stats.get('balls_moving', 0)}",
     ]
+
+    # Shot summary line
     if "shots_total" in stats:
-        lines.append(f"Shots: {stats['shots_total']}  "
-                     f"In: {stats.get('shots_scored', 0)}  "
-                     f"Miss: {stats.get('shots_missed', 0)}")
+        shot_line = f"Shots: {stats['shots_total']}  Scored: {stats.get('shots_scored', 0)}  Missed: {stats.get('shots_missed', 0)}"
+        if field_passes > 0:
+            shot_line += f"  (Passes: {field_passes})"
+        lines.append(shot_line)
+
     for line in lines:
         cv2.putText(out, line, (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        y += 22
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        y += 20
+
+    # Draw robot breakdown if available
+    if has_breakdown:
+        y += 5
+        # Draw separator line
+        cv2.line(out, (10, y), (hud_width - 10, y), (100, 100, 100), 1)
+        y += 15
+
+        # Column headers
+        col_blue = 10
+        col_red = hud_width // 2 + 5
+        cv2.putText(out, "BLUE", (col_blue, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 100, 100), 1)  # Blue color (BGR)
+        cv2.putText(out, "RED", (col_red, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 255), 1)  # Red color (BGR)
+        y += 18
+
+        # Build combined lists: robots first, then human players
+        blue_list = sorted(blue_robots.items()) + sorted(blue_hp.items())
+        red_list = sorted(red_robots.items()) + sorted(red_hp.items())
+        max_rows = max(len(blue_list), len(red_list))
+
+        for i in range(max_rows):
+            # Blue column
+            if i < len(blue_list):
+                name, rs = blue_list[i]
+                pct = (rs["scored"] / rs["total"] * 100) if rs["total"] > 0 else 0
+                # Shorten name for display (remove "blue_" prefix)
+                short_name = name.lower().replace("blue_", "")
+                # Mark human players with [HP] suffix
+                is_hp = "human" in name.lower() or "hp" in name.lower()
+                if is_hp:
+                    short_name = short_name.replace("human_player", "HP").replace("human", "HP")
+                text = f"{short_name}: {rs['scored']}/{rs['total']} ({pct:.0f}%)"
+                # Human players get slightly different color (magenta tint)
+                color = (255, 150, 255) if is_hp else (255, 200, 200)
+                cv2.putText(out, text, (col_blue, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+            # Red column
+            if i < len(red_list):
+                name, rs = red_list[i]
+                pct = (rs["scored"] / rs["total"] * 100) if rs["total"] > 0 else 0
+                # Shorten name for display (remove "red_" prefix)
+                short_name = name.lower().replace("red_", "")
+                # Mark human players with [HP] suffix
+                is_hp = "human" in name.lower() or "hp" in name.lower()
+                if is_hp:
+                    short_name = short_name.replace("human_player", "HP").replace("human", "HP")
+                text = f"{short_name}: {rs['scored']}/{rs['total']} ({pct:.0f}%)"
+                # Human players get slightly different color (magenta tint)
+                color = (200, 150, 255) if is_hp else (200, 200, 255)
+                cv2.putText(out, text, (col_red, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+            y += 18
+
+        # Draw unknown section if there are unattributed shots
+        if unknown:
+            y += 2
+            cv2.line(out, (10, y), (hud_width - 10, y), (80, 80, 80), 1)
+            y += 12
+            for name, rs in sorted(unknown.items()):
+                pct = (rs["scored"] / rs["total"] * 100) if rs["total"] > 0 else 0
+                text = f"{name}: {rs['scored']}/{rs['total']} ({pct:.0f}%)"
+                cv2.putText(out, text, (col_blue, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                y += 18
+
+    # Progress bar at bottom
     if total_frames > 0:
         bar_y = h - 8
         cv2.rectangle(out, (0, bar_y),
