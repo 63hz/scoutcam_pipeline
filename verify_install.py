@@ -24,17 +24,37 @@ def check_import(module_name, display_name=None, required=True):
         return False
 
 def check_cuda():
-    """Check PyTorch CUDA availability."""
+    """Check PyTorch CUDA availability - detects CPU-only builds."""
     try:
         import torch
+        version = torch.__version__
+        is_cuda_build = '+cu' in version
+
+        if not is_cuda_build:
+            print(f"  [!!] PyTorch {version} is a CPU-ONLY build!")
+            print(f"       This is the #1 cause of slow YOLO performance.")
+            print(f"       Fix: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126")
+            return False
+
         if torch.cuda.is_available():
             device_name = torch.cuda.get_device_name(0)
             cuda_version = torch.version.cuda
-            print(f"  [OK] CUDA available: {cuda_version}")
+            print(f"  [OK] CUDA build: {version}")
+            print(f"  [OK] CUDA runtime: {cuda_version}")
             print(f"  [OK] GPU device: {device_name}")
+            # Actually test GPU compute
+            try:
+                t = torch.randn(100, 100, device='cuda')
+                _ = t @ t
+                torch.cuda.synchronize()
+                print(f"  [OK] GPU compute test: PASS")
+            except Exception as e:
+                print(f"  [!!] GPU compute test FAILED: {e}")
+                return False
             return True
         else:
-            print("  [!!] CUDA not available - YOLO will run on CPU (slow)")
+            print(f"  [!!] PyTorch {version} has CUDA support but CUDA runtime not available")
+            print(f"       Check NVIDIA driver installation")
             return False
     except ImportError:
         print("  [!!] PyTorch not installed")

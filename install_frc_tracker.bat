@@ -93,8 +93,29 @@ echo Installing YOLO (ultralytics)...
 pip install ultralytics
 
 echo.
-echo Installing PyTorch with CUDA 12.1 support...
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+echo Installing PyTorch with CUDA support...
+echo Trying CUDA 12.6 index first (best Python version support)...
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+REM Verify we actually got a CUDA build (not CPU fallback from PyPI)
+python -c "import torch; assert '+cu' in torch.__version__, f'Got CPU-only build: {torch.__version__}'" >nul 2>&1
+if %errorLevel% neq 0 (
+    echo CUDA 12.6 wheels not available for this Python version.
+    echo Trying CUDA 12.4...
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+    python -c "import torch; assert '+cu' in torch.__version__, f'Got CPU-only build: {torch.__version__}'" >nul 2>&1
+    if %errorLevel% neq 0 (
+        echo CUDA 12.4 wheels not available either.
+        echo Trying CUDA 12.1...
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+        python -c "import torch; assert '+cu' in torch.__version__, f'Got CPU-only build: {torch.__version__}'" >nul 2>&1
+        if %errorLevel% neq 0 (
+            echo.
+            echo WARNING: No CUDA-enabled PyTorch wheels found for your Python version!
+            echo PyTorch installed as CPU-only. YOLO will be very slow.
+            echo Consider installing Python 3.11 or 3.12 for best CUDA support.
+        )
+    )
+)
 
 echo.
 echo Installing GPU acceleration (CuPy for CUDA 12.x)...
@@ -121,7 +142,10 @@ python -c "from ultralytics import YOLO; print('Ultralytics YOLO: OK')"
 
 echo.
 echo Testing PyTorch CUDA...
-python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
+python -c "import torch; v=torch.__version__; cuda=torch.cuda.is_available(); print(f'PyTorch: {v}'); gpu='+cu' in v; print(f'CUDA build: {\"YES\" if gpu else \"NO (CPU-only!) - YOLO will be slow\"}'); print(f'CUDA runtime: {torch.cuda.is_available()}'); dev=torch.cuda.get_device_name(0) if cuda else 'N/A'; print(f'GPU device: {dev}'); ok=gpu and cuda; print(f'GPU compute test: {\"PASS\" if ok else \"FAIL\"}')" 2>&1
+if %errorLevel% neq 0 (
+    echo [!!] PyTorch CUDA verification failed
+)
 
 echo.
 echo Testing CuPy...

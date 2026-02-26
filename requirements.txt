@@ -11,10 +11,11 @@ scipy>=1.7.0
 ultralytics>=8.0.0
 
 # PyTorch - install separately with CUDA support:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# For older Python (<3.13), cu124 or cu121 also work:
 # pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-# Uncomment below for CPU-only (not recommended):
-# torch>=2.0.0
-# torchvision>=0.15.0
+# WARNING: plain "pip install torch" gives CPU-only build - YOLO will be very slow!
+# Verify with: python -c "import torch; print(torch.__version__)"  # should show +cu126
 
 # GPU acceleration (optional but recommended)
 # Install separately: pip install cupy-cuda12x
