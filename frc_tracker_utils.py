@@ -2206,6 +2206,730 @@ class _TrackerOutputWrapper:
         return self._tracker.robot_bbox
 
 
+# ============================================================================
+# KALMAN BALL TRACKER (OC-SORT style tracker for balls)
+# ============================================================================
+
+class KalmanBallTracker:
+    """
+    Kalman filter for tracking a single ball.
+
+    State vector: [cx, cy, r, vx, vy, vr]
+        - (cx, cy): center of ball
+        - r: radius
+        - (vx, vy): velocities
+        - vr: radius change rate
+
+    Uses a 6-state model (vs 8-state for robots) since balls are circular
+    and don't need separate width/height tracking.
+    """
+    _count = 0  # Global ID counter
+
+    def __init__(self, detection, config=None):
+        """
+        Initialize tracker with first detection.
+
+        Args:
+            detection: Detection dict with cx, cy, radius, area, bbox
+            config: Optional config dict for noise tuning
+        """
+        cfg = (config or {}).get("ball_tracking", {})
+
+        # 6 state dimensions, 3 measurement dimensions
+        self.kf = cv2.KalmanFilter(6, 3)
+
+        # Transition matrix (constant velocity model)
+        # cx_new = cx + vx, cy_new = cy + vy, r_new = r + vr
+        self.kf.transitionMatrix = np.array([
+            [1, 0, 0, 1, 0, 0],
+            [0, 1, 0, 0, 1, 0],
+            [0, 0, 1, 0, 0, 1],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1],
+        ], dtype=np.float32)
+
+        # Measurement matrix (we observe cx, cy, r)
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0],
+        ], dtype=np.float32)
+
+        # Process noise - balls change velocity more abruptly than robots
+        pn_pos = cfg.get("process_noise_position", 1.0)
+        pn_vel = cfg.get("process_noise_velocity", 5.0)
+        self.kf.processNoiseCov = np.diag([
+            pn_pos, pn_pos, pn_pos * 0.5,   # position/radius noise
+            pn_vel, pn_vel, pn_vel * 0.1,    # velocity noise
+        ]).astype(np.float32)
+
+        # Measurement noise
+        mn = cfg.get("measurement_noise", 2.0)
+        self.kf.measurementNoiseCov = np.eye(3, dtype=np.float32) * mn
+
+        # Initial state covariance (high uncertainty)
+        self.kf.errorCovPost = np.eye(6, dtype=np.float32) * 10.0
+        self.kf.errorCovPost[3:, 3:] *= 100.0  # Very uncertain about initial velocity
+
+        # Initialize state with first observation
+        cx = float(detection["cx"])
+        cy = float(detection["cy"])
+        r = float(detection.get("radius", 10))
+        self.kf.statePost = np.array([cx, cy, r, 0, 0, 0], dtype=np.float32)
+
+        # Tracking metadata
+        self.id = KalmanBallTracker._count
+        KalmanBallTracker._count += 1
+        self.hits = 1
+        self.age = 0
+        self.time_since_update = 0
+
+        # Trail for visualization and trajectory analysis
+        trail_length = cfg.get("trail_length", 30)
+        self.trail = deque(maxlen=trail_length)
+        self.trail.append((cx, cy))
+
+        # OC-SORT: store recent observations for ORU
+        self.observations = deque(maxlen=10)
+        self.observations.append((cx, cy, r))
+        self.last_observation = (cx, cy, r)
+
+        # Velocity from last observation (for OCM)
+        self.observed_velocity = np.array([0.0, 0.0], dtype=np.float32)
+
+        # Detection metadata
+        self.last_detection = detection
+        self.confidence = detection.get("confidence", 1.0)
+        self._confidence_sum = self.confidence
+        self._confidence_count = 1
+
+        # Shot detection fields (set externally by ShotDetector)
+        self.shot_id = None
+        self.robot_id = None
+        self.shot_result = None
+
+        # Config reference for ORU/OCM
+        self._use_oru = cfg.get("use_oru", True)
+        self._use_ocm = cfg.get("use_ocm", True)
+
+    def predict(self):
+        """
+        Advance state by one frame using Kalman prediction.
+
+        Returns:
+            Predicted (cx, cy, r) tuple
+        """
+        # OCM: Blend predicted velocity with observed velocity
+        if self._use_ocm and self.time_since_update > 0:
+            alpha = 0.5
+            state = self.kf.statePost.flatten()
+            state[3] = alpha * self.observed_velocity[0] + (1 - alpha) * state[3]
+            state[4] = alpha * self.observed_velocity[1] + (1 - alpha) * state[4]
+            self.kf.statePost = state.reshape(-1, 1)
+
+        state = self.kf.predict().flatten()
+        self.age += 1
+        self.time_since_update += 1
+
+        cx, cy, r = float(state[0]), float(state[1]), max(1.0, float(state[2]))
+        return (cx, cy, r)
+
+    def update(self, detection):
+        """
+        Correct state with new observation.
+
+        Args:
+            detection: Detection dict with cx, cy, radius
+        """
+        cx = float(detection["cx"])
+        cy = float(detection["cy"])
+        r = float(detection.get("radius", 10))
+        measurement = np.array([[cx], [cy], [r]], dtype=np.float32)
+
+        # Compute observed velocity
+        if self.last_observation is not None:
+            old_cx, old_cy, _ = self.last_observation
+            self.observed_velocity = np.array([cx - old_cx, cy - old_cy], dtype=np.float32)
+
+        # ORU: Smooth trajectory after occlusion
+        if self._use_oru and self.time_since_update > 1:
+            self._apply_oru(cx, cy, r)
+
+        self.kf.correct(measurement)
+        self.hits += 1
+        self.time_since_update = 0
+        self.observations.append((cx, cy, r))
+        self.last_observation = (cx, cy, r)
+        self.last_detection = detection
+        self.trail.append((cx, cy))
+
+        # Update running confidence average
+        det_conf = detection.get("confidence", 1.0)
+        self._confidence_sum += det_conf
+        self._confidence_count += 1
+        self.confidence = self._confidence_sum / self._confidence_count
+
+    def _apply_oru(self, current_cx, current_cy, current_r):
+        """Observation-Centric Re-update: smooth trajectory after occlusion."""
+        if len(self.observations) == 0 or self.time_since_update <= 1:
+            return
+
+        last_cx, last_cy, last_r = self.observations[-1]
+        n_missing = self.time_since_update - 1
+
+        for i in range(1, n_missing + 1):
+            t = i / (n_missing + 1)
+            vcx = last_cx + t * (current_cx - last_cx)
+            vcy = last_cy + t * (current_cy - last_cy)
+            vr = last_r + t * (current_r - last_r)
+
+            vmeasurement = np.array([[vcx], [vcy], [vr]], dtype=np.float32)
+            old_noise = self.kf.measurementNoiseCov.copy()
+            self.kf.measurementNoiseCov *= 2.0
+            self.kf.correct(vmeasurement)
+            self.kf.measurementNoiseCov = old_noise
+
+    def get_state(self):
+        """Get current state estimate (cx, cy, r)."""
+        state = self.kf.statePost.flatten()
+        return (float(state[0]), float(state[1]), max(1.0, float(state[2])))
+
+    def get_velocity(self):
+        """Get current velocity estimate (vx, vy)."""
+        state = self.kf.statePost.flatten()
+        return (float(state[3]), float(state[4]))
+
+    def get_speed(self):
+        """Get current speed (magnitude of velocity)."""
+        vx, vy = self.get_velocity()
+        return math.sqrt(vx * vx + vy * vy)
+
+    def get_predicted_position(self):
+        """Get predicted next position without advancing state."""
+        state = self.kf.statePost.flatten()
+        return (float(state[0] + state[3]), float(state[1] + state[4]))
+
+
+class OCSORTBallTracker:
+    """
+    OC-SORT multi-object tracker for ball tracking.
+
+    Optimized for tracking many identical-looking balls (100+) through
+    overlaps, clusters, and fast motion using:
+    - Kalman filter motion prediction
+    - Multi-signal cost matrix (predicted distance + velocity alignment + size)
+    - Velocity-adaptive gating for efficient matching
+    - Hungarian algorithm for globally optimal assignment
+    - Track lifecycle (tentative/confirmed/coasting/dead)
+    - Dead track re-identification
+
+    Usage:
+        tracker = OCSORTBallTracker(config)
+        objects = tracker.update(detections)
+    """
+
+    def __init__(self, config):
+        self.config = config
+        cfg = config.get("ball_tracking", {})
+
+        self.max_distance = cfg.get("max_distance", 120)
+        self.max_age = cfg.get("max_age", 15)
+        self.min_hits = cfg.get("min_hits", 3)
+        self.trail_length = cfg.get("trail_length", 30)
+        self.match_threshold = cfg.get("match_threshold", 0.8)
+
+        # Velocity-adaptive gating
+        self.base_gate_radius = cfg.get("base_gate_radius", 30)
+        self.gate_factor = cfg.get("gate_factor", 2.5)
+
+        # Cost weights
+        weights = cfg.get("cost_weights", {})
+        self.w_pred_dist = weights.get("w_predicted_dist", 0.5)
+        self.w_velocity = weights.get("w_velocity", 0.3)
+        self.w_size = weights.get("w_size", 0.2)
+
+        # Re-identification
+        self.enable_reidentification = cfg.get("enable_reidentification", True)
+        self.dead_track_max_age = cfg.get("dead_track_max_age", 30)
+
+        # Goal-proximity track protection
+        self.goal_proximity_extension = cfg.get("goal_proximity_extension", 2.0)
+        self._goal_regions = config.get("goal_regions", [])
+
+        self.trackers = []  # List of KalmanBallTracker
+        self.frame_count = 0
+
+        # Dead tracks for re-identification
+        self._dead_tracks = []
+
+        # Stats
+        self._stats = {
+            "matches": 0,
+            "unmatched_tracks": 0,
+            "unmatched_dets": 0,
+            "reidentifications": 0,
+            "confirmed": 0,
+            "coasting": 0,
+            "tentative": 0,
+        }
+
+        # Next ID counter (aligned with KalmanBallTracker._count)
+        self._next_id_offset = KalmanBallTracker._count
+
+        print(f"[BALL TRACKER] OC-SORT initialized: max_dist={self.max_distance}, "
+              f"max_age={self.max_age}, min_hits={self.min_hits}, "
+              f"gate={self.base_gate_radius}+speed*{self.gate_factor}")
+
+    def reset(self):
+        """Reset all tracking state."""
+        self.trackers = []
+        self._dead_tracks = []
+        self.frame_count = 0
+        self._reset_stats()
+
+    def _reset_stats(self):
+        self._stats = {k: 0 for k in self._stats}
+
+    def update(self, detections):
+        """
+        Update tracker with new frame detections.
+
+        Args:
+            detections: List of detection dicts with cx, cy, radius, area, bbox,
+                       and optionally confidence
+
+        Returns:
+            OrderedDict of track_id -> TrackedObject-compatible wrapper
+        """
+        self.frame_count += 1
+
+        # Step 1: Predict new positions for all existing trackers
+        predictions = []
+        for t in self.trackers:
+            pred = t.predict()  # Advances state, returns (cx, cy, r)
+            predictions.append(pred)
+
+        # Step 2: Handle empty cases
+        if len(detections) == 0:
+            self._cleanup_dead_tracks()
+            return self._get_output()
+
+        if len(self.trackers) == 0:
+            for det in detections:
+                self._create_tracker(det)
+            return self._get_output()
+
+        # Step 3: Build gated cost matrix
+        n_tracks = len(self.trackers)
+        n_dets = len(detections)
+
+        # Pre-compute detection positions
+        det_positions = np.array([(d["cx"], d["cy"]) for d in detections], dtype=np.float32)
+        det_radii = np.array([d.get("radius", 10) for d in detections], dtype=np.float32)
+
+        # Full cost matrix initialized to high cost (no match)
+        cost_matrix = np.ones((n_tracks, n_dets), dtype=np.float32)
+        gated = np.zeros((n_tracks, n_dets), dtype=bool)  # True = within gate
+
+        for i, t in enumerate(self.trackers):
+            pred_cx, pred_cy, pred_r = predictions[i]
+            speed = t.get_speed()
+            gate = max(self.base_gate_radius, speed * self.gate_factor)
+            vx, vy = t.get_velocity()
+
+            for j in range(n_dets):
+                dx = det_positions[j, 0] - pred_cx
+                dy = det_positions[j, 1] - pred_cy
+                dist = math.sqrt(dx * dx + dy * dy)
+
+                # Gating: skip if too far
+                if dist > gate:
+                    continue
+
+                gated[i, j] = True
+
+                # Cost component 1: Predicted distance (normalized)
+                dist_cost = dist / self.max_distance
+                dist_cost = min(dist_cost, 1.0)
+
+                # Cost component 2: Velocity alignment
+                vel_cost = 0.5  # Default (no velocity info yet)
+                if speed > 2.0:  # Only meaningful if ball is moving
+                    # Vector from predicted position to detection
+                    det_dx = det_positions[j, 0] - pred_cx
+                    det_dy = det_positions[j, 1] - pred_cy
+                    det_dist = math.sqrt(det_dx * det_dx + det_dy * det_dy)
+                    if det_dist > 0.1:
+                        # Cosine similarity between velocity and track-to-detection vector
+                        cos_angle = (vx * det_dx + vy * det_dy) / (speed * det_dist)
+                        vel_cost = (1.0 - cos_angle) / 2.0  # 0=perfect alignment, 1=opposite
+
+                # Cost component 3: Size consistency
+                size_cost = 0.0
+                if pred_r > 0 and det_radii[j] > 0:
+                    ratio = max(pred_r, det_radii[j]) / max(min(pred_r, det_radii[j]), 0.1)
+                    size_cost = min((ratio - 1.0) / 2.0, 1.0)  # 0 if same size, 1 if 3x different
+
+                # Weighted combined cost
+                cost_matrix[i, j] = (
+                    self.w_pred_dist * dist_cost +
+                    self.w_velocity * vel_cost +
+                    self.w_size * size_cost
+                )
+
+        # Step 4: Hungarian matching on gated cost matrix
+        # Set ungated entries to high cost so they're never matched
+        cost_matrix[~gated] = 1.0
+
+        if _SCIPY_AVAILABLE:
+            row_indices, col_indices = linear_sum_assignment(cost_matrix)
+        else:
+            row_indices, col_indices = self._greedy_matching(cost_matrix)
+
+        # Step 5: Process matches
+        matched_tracks = set()
+        matched_dets = set()
+
+        for r, c in zip(row_indices, col_indices):
+            if cost_matrix[r, c] > self.match_threshold:
+                continue  # Cost too high, not a valid match
+            if not gated[r, c]:
+                continue  # Wasn't within gate
+
+            self.trackers[r].update(detections[c])
+            matched_tracks.add(r)
+            matched_dets.add(c)
+            self._stats["matches"] += 1
+
+        # Step 6: Handle unmatched tracks
+        for i in range(n_tracks):
+            if i not in matched_tracks:
+                self._stats["unmatched_tracks"] += 1
+                # Track already predicted in Step 1 (time_since_update incremented)
+
+        # Step 7: Handle unmatched detections (create new tracks)
+        for j in range(n_dets):
+            if j not in matched_dets:
+                self._create_tracker(detections[j])
+                self._stats["unmatched_dets"] += 1
+
+        # Step 8: Clean up dead tracks
+        self._cleanup_dead_tracks()
+
+        return self._get_output()
+
+    def _greedy_matching(self, cost_matrix):
+        """Fallback greedy matching when scipy unavailable."""
+        n, m = cost_matrix.shape
+        rows, cols = [], []
+        matched_r, matched_c = set(), set()
+
+        flat = np.argsort(cost_matrix, axis=None)
+        row_idx, col_idx = np.unravel_index(flat, cost_matrix.shape)
+
+        for r, c in zip(row_idx, col_idx):
+            if r in matched_r or c in matched_c:
+                continue
+            if cost_matrix[r, c] >= 1.0:
+                break
+            rows.append(r)
+            cols.append(c)
+            matched_r.add(r)
+            matched_c.add(c)
+
+        return rows, cols
+
+    def _create_tracker(self, detection):
+        """Create new tracker or revive a dead track via re-identification."""
+        if self.enable_reidentification and self._dead_tracks:
+            best_match = None
+            best_score = float("inf")
+
+            det_cx = float(detection["cx"])
+            det_cy = float(detection["cy"])
+
+            for i, dt in enumerate(self._dead_tracks):
+                dead_t = dt["tracker"]
+                frames_since_death = self.frame_count - dt["death_frame"]
+
+                # Extrapolate dead track position
+                dcx, dcy, _ = dead_t.get_state()
+                dvx, dvy = dead_t.get_velocity()
+                pred_cx = dcx + dvx * frames_since_death
+                pred_cy = dcy + dvy * frames_since_death
+
+                dist = math.sqrt((pred_cx - det_cx) ** 2 + (pred_cy - det_cy) ** 2)
+
+                # Must be within reasonable distance
+                max_reid_dist = self.base_gate_radius + dead_t.get_speed() * self.gate_factor
+                if dist < max_reid_dist and dist < best_score:
+                    best_score = dist
+                    best_match = i
+
+            if best_match is not None:
+                dt = self._dead_tracks.pop(best_match)
+                revived = dt["tracker"]
+                revived.update(detection)
+                self.trackers.append(revived)
+                self._stats["reidentifications"] += 1
+                return revived
+
+        # No re-ID match — create fresh tracker
+        tracker = KalmanBallTracker(detection, self.config)
+        self.trackers.append(tracker)
+        return tracker
+
+    def _is_near_goal(self, cx, cy):
+        """Check if position is near any goal region (for track protection)."""
+        for goal in self._goal_regions:
+            if "polygon" in goal:
+                # Polygon goal — use bounding box as approximation
+                pts = goal["polygon"]
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                margin = 100
+                if (min(xs) - margin <= cx <= max(xs) + margin and
+                        min(ys) - margin <= cy <= max(ys) + margin):
+                    return True
+            elif all(k in goal for k in ("x", "y", "w", "h")):
+                gx, gy, gw, gh = goal["x"], goal["y"], goal["w"], goal["h"]
+                margin = 100
+                if (gx - margin <= cx <= gx + gw + margin and
+                        gy - margin <= cy <= gy + gh + margin):
+                    return True
+        return False
+
+    def _cleanup_dead_tracks(self):
+        """Remove tracks that have been missing too long."""
+        surviving = []
+        for t in self.trackers:
+            cx, cy, _ = t.get_state()
+            effective_max_age = self.max_age
+            if self._is_near_goal(cx, cy):
+                effective_max_age = int(self.max_age * self.goal_proximity_extension)
+
+            if t.time_since_update <= effective_max_age:
+                surviving.append(t)
+            elif self.enable_reidentification:
+                self._dead_tracks.append({
+                    "tracker": t,
+                    "death_frame": self.frame_count,
+                })
+        self.trackers = surviving
+
+        # Purge old dead tracks
+        if self.enable_reidentification:
+            self._dead_tracks = [
+                dt for dt in self._dead_tracks
+                if self.frame_count - dt["death_frame"] <= self.dead_track_max_age
+            ]
+
+    def _get_output(self):
+        """Convert internal trackers to TrackedObject-compatible output."""
+        output = OrderedDict()
+
+        confirmed = 0
+        coasting = 0
+        tentative = 0
+
+        for t in self.trackers:
+            if t.hits >= self.min_hits:
+                if t.time_since_update == 0:
+                    confirmed += 1
+                else:
+                    coasting += 1
+                # Wrap and output confirmed/coasting tracks
+                wrapper = _BallTrackerOutputWrapper(t, self.trail_length)
+                output[t.id] = wrapper
+            else:
+                tentative += 1
+
+        self._stats["confirmed"] = confirmed
+        self._stats["coasting"] = coasting
+        self._stats["tentative"] = tentative
+
+        return output
+
+    def remove_objects(self, obj_ids):
+        """Remove specific objects from tracking (e.g., balls that scored)."""
+        remove_set = set(obj_ids)
+        self.trackers = [t for t in self.trackers if t.id not in remove_set]
+
+    def get_stats(self):
+        """Get tracking statistics for debugging/HUD display."""
+        return {
+            "active_tracks": len(self.trackers),
+            "dead_tracks": len(self._dead_tracks),
+            "frame_count": self.frame_count,
+            **self._stats
+        }
+
+
+class _BallTrackerOutputWrapper:
+    """
+    Wraps KalmanBallTracker to match TrackedObject interface.
+
+    This ensures OCSORTBallTracker is a drop-in replacement for CentroidTracker
+    in all pipeline stages.
+    """
+
+    def __init__(self, tracker, trail_length=30):
+        self._tracker = tracker
+        self._trail_length = trail_length
+
+    @property
+    def id(self):
+        return self._tracker.id
+
+    @property
+    def cx(self):
+        cx, _, _ = self._tracker.get_state()
+        return cx
+
+    @property
+    def cy(self):
+        _, cy, _ = self._tracker.get_state()
+        return cy
+
+    @property
+    def radius(self):
+        _, _, r = self._tracker.get_state()
+        return r
+
+    @property
+    def area(self):
+        r = self.radius
+        return math.pi * r * r
+
+    @property
+    def bbox(self):
+        cx, cy, r = self._tracker.get_state()
+        return (int(cx - r), int(cy - r), int(2 * r), int(2 * r))
+
+    @property
+    def disappeared(self):
+        return self._tracker.time_since_update
+
+    @property
+    def age(self):
+        return self._tracker.age
+
+    @property
+    def trail(self):
+        return self._tracker.trail
+
+    @property
+    def vx(self):
+        vx, _ = self._tracker.get_velocity()
+        return vx
+
+    @property
+    def vy(self):
+        _, vy = self._tracker.get_velocity()
+        return vy
+
+    @property
+    def speed(self):
+        return self._tracker.get_speed()
+
+    @property
+    def is_moving(self):
+        return self.speed > 2.0
+
+    @property
+    def confidence(self):
+        return self._tracker.confidence
+
+    @property
+    def predicted_cx(self):
+        px, _ = self._tracker.get_predicted_position()
+        return px
+
+    @property
+    def predicted_cy(self):
+        _, py = self._tracker.get_predicted_position()
+        return py
+
+    # Shot detection fields (read/write passthrough)
+    @property
+    def shot_id(self):
+        return self._tracker.shot_id
+
+    @shot_id.setter
+    def shot_id(self, value):
+        self._tracker.shot_id = value
+
+    @property
+    def robot_id(self):
+        return self._tracker.robot_id
+
+    @robot_id.setter
+    def robot_id(self, value):
+        self._tracker.robot_id = value
+
+    @property
+    def shot_result(self):
+        return self._tracker.shot_result
+
+    @shot_result.setter
+    def shot_result(self, value):
+        self._tracker.shot_result = value
+
+    def update(self, detection):
+        """Update with new detection (called by external code if needed)."""
+        self._tracker.update(detection)
+
+    def get_smoothed_velocity(self, window=3):
+        """Get smoothed velocity over the last N frames from trail."""
+        trail = self._tracker.trail
+        if len(trail) < 2:
+            return (0.0, 0.0, 0.0)
+
+        positions = list(trail)[-min(window + 1, len(trail)):]
+        if len(positions) < 2:
+            return (0.0, 0.0, 0.0)
+
+        total_vx = positions[-1][0] - positions[0][0]
+        total_vy = positions[-1][1] - positions[0][1]
+        n_frames = len(positions) - 1
+
+        avg_vx = total_vx / n_frames
+        avg_vy = total_vy / n_frames
+        avg_speed = math.sqrt(avg_vx ** 2 + avg_vy ** 2)
+
+        return (avg_vx, avg_vy, avg_speed)
+
+
+def create_ball_tracker(config):
+    """
+    Factory function to create the appropriate ball tracker.
+
+    Uses config 'ball_tracking.tracker' to select:
+    - "kalman" (default): OC-SORT ball tracker with Kalman filter
+    - "centroid": Legacy greedy centroid tracker
+
+    Args:
+        config: Configuration dict
+
+    Returns:
+        Ball tracker instance (OCSORTBallTracker or CentroidTracker)
+    """
+    ball_cfg = config.get("ball_tracking", {})
+    tracker_type = ball_cfg.get("tracker", "centroid")
+
+    if tracker_type == "kalman":
+        return OCSORTBallTracker(config)
+    else:
+        # Legacy centroid tracker
+        tracking_cfg = config.get("tracking", {})
+        return CentroidTracker(
+            max_disappeared=tracking_cfg.get("max_frames_missing", 8),
+            max_distance=tracking_cfg.get("max_distance", 80),
+            trail_length=tracking_cfg.get("trail_length", 30),
+        )
+
+
 class RobotDetector:
     """
     Detects and tracks FRC robots by bumper color.
@@ -3597,6 +4321,143 @@ def select_zones_interactive(video_path, zone_type="goal"):
 
 
 # ============================================================================
+# TRACKING DIAGNOSTICS
+# ============================================================================
+
+class TrackingDiagnostics:
+    """
+    Collects and exports track lifecycle data for debugging and analysis.
+
+    Records the full life of each track: birth, death, hit count, speed,
+    shot association. Exports to CSV for post-hoc analysis.
+
+    Usage:
+        diag = TrackingDiagnostics()
+        # In main loop:
+        diag.update(tracker, frame_num)
+        # After processing:
+        diag.export("video_track_log.csv")
+    """
+
+    def __init__(self):
+        self._track_records = {}  # track_id -> dict of lifecycle data
+        self._completed_records = []  # Records for tracks that have died
+
+    def update(self, tracker_output, frame_num, tracker=None):
+        """
+        Update diagnostics with current tracker state.
+
+        Args:
+            tracker_output: OrderedDict from tracker.update() (id -> TrackedObject)
+            frame_num: Current frame number
+            tracker: Optional OCSORTBallTracker for internal stats
+        """
+        active_ids = set()
+
+        for obj_id, obj in tracker_output.items():
+            active_ids.add(obj_id)
+
+            if obj_id not in self._track_records:
+                # New track born
+                self._track_records[obj_id] = {
+                    "track_id": obj_id,
+                    "born_frame": frame_num,
+                    "died_frame": None,
+                    "hit_count": 0,
+                    "miss_count": 0,
+                    "total_frames": 0,
+                    "max_speed": 0.0,
+                    "avg_confidence": 0.0,
+                    "_conf_sum": 0.0,
+                    "shot_id": None,
+                    "shot_result": None,
+                    "attributed_robot": None,
+                }
+
+            rec = self._track_records[obj_id]
+            rec["total_frames"] += 1
+
+            if obj.disappeared == 0:
+                rec["hit_count"] += 1
+            else:
+                rec["miss_count"] += 1
+
+            speed = obj.speed if hasattr(obj, 'speed') else 0.0
+            rec["max_speed"] = max(rec["max_speed"], speed)
+
+            conf = getattr(obj, 'confidence', 1.0)
+            rec["_conf_sum"] += conf
+            rec["avg_confidence"] = rec["_conf_sum"] / rec["total_frames"]
+
+            # Track shot association
+            if hasattr(obj, 'shot_id') and obj.shot_id is not None:
+                rec["shot_id"] = obj.shot_id
+            if hasattr(obj, 'shot_result') and obj.shot_result is not None:
+                rec["shot_result"] = obj.shot_result
+            if hasattr(obj, 'robot_id') and obj.robot_id is not None:
+                rec["attributed_robot"] = obj.robot_id
+
+        # Check for tracks that have died (no longer in output)
+        dead_ids = set(self._track_records.keys()) - active_ids
+        for dead_id in dead_ids:
+            rec = self._track_records.pop(dead_id)
+            rec["died_frame"] = frame_num
+            self._completed_records.append(rec)
+
+    def get_summary(self):
+        """Get summary statistics about tracking quality."""
+        all_records = self._completed_records + list(self._track_records.values())
+        if not all_records:
+            return {"total_tracks": 0}
+
+        total = len(all_records)
+        avg_lifespan = sum(r["total_frames"] for r in all_records) / total
+        avg_hit_rate = sum(
+            r["hit_count"] / max(r["total_frames"], 1) for r in all_records
+        ) / total
+        shot_tracks = sum(1 for r in all_records if r["shot_id"] is not None)
+
+        return {
+            "total_tracks": total,
+            "avg_lifespan_frames": avg_lifespan,
+            "avg_hit_rate": avg_hit_rate,
+            "tracks_with_shots": shot_tracks,
+            "active_tracks": len(self._track_records),
+            "completed_tracks": len(self._completed_records),
+        }
+
+    def export(self, path):
+        """Export all track lifecycle data to CSV."""
+        import csv
+        all_records = self._completed_records + list(self._track_records.values())
+
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "track_id", "born_frame", "died_frame", "total_frames",
+                "hit_count", "miss_count", "hit_rate", "max_speed",
+                "avg_confidence", "shot_id", "shot_result", "attributed_robot",
+            ])
+            for rec in sorted(all_records, key=lambda r: r["track_id"]):
+                hit_rate = rec["hit_count"] / max(rec["total_frames"], 1)
+                writer.writerow([
+                    rec["track_id"],
+                    rec["born_frame"],
+                    rec["died_frame"] or "",
+                    rec["total_frames"],
+                    rec["hit_count"],
+                    rec["miss_count"],
+                    f"{hit_rate:.2f}",
+                    f"{rec['max_speed']:.1f}",
+                    f"{rec['avg_confidence']:.2f}",
+                    rec["shot_id"] or "",
+                    rec["shot_result"] or "",
+                    rec["attributed_robot"] or "",
+                ])
+        print(f"[DIAG] Exported {len(all_records)} track records to {path}")
+
+
+# ============================================================================
 # HUD OVERLAY
 # ============================================================================
 
@@ -3661,6 +4522,18 @@ def draw_hud(frame, stats, frame_num=0, total_frames=0):
         f"Frame: {frame_num}/{total_frames}",
         f"Detected: {stats.get('balls_detected', 0)}  Tracked: {stats.get('balls_tracked', 0)}  Moving: {stats.get('balls_moving', 0)}",
     ]
+
+    # Tracker quality line (from OCSORTBallTracker.get_stats())
+    if "confirmed" in stats or "coasting" in stats:
+        track_line = (
+            f"Tracks: {stats.get('confirmed', 0)} confirmed | "
+            f"{stats.get('coasting', 0)} coasting | "
+            f"{stats.get('tentative', 0)} tentative"
+        )
+        reids = stats.get("reidentifications", 0)
+        if reids > 0:
+            track_line += f" | Re-IDs: {reids}"
+        lines.append(track_line)
 
     # Shot summary line
     if "shots_total" in stats:

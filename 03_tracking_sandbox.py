@@ -44,7 +44,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from frc_tracker_utils import (
     load_config, save_config, open_video, apply_roi,
-    BallDetector, CentroidTracker, draw_hud
+    BallDetector, CentroidTracker, draw_hud, create_ball_tracker
 )
 
 # ============================================================================
@@ -131,12 +131,7 @@ def main():
     cap, vid_info = open_video(VIDEO_PATH)
     detector = BallDetector(config)
 
-    track_cfg = config["tracking"]
-    tracker = CentroidTracker(
-        max_disappeared=track_cfg["max_frames_missing"],
-        max_distance=track_cfg["max_distance"],
-        trail_length=track_cfg["trail_length"],
-    )
+    tracker = create_ball_tracker(config)
 
     # Display toggles
     show_trails = True

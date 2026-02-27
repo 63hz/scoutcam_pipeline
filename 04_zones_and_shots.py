@@ -50,7 +50,7 @@ from frc_tracker_utils import (
     load_config, save_config, open_video, apply_roi,
     BallDetector, CentroidTracker, draw_hud, draw_zones,
     point_in_rect, point_in_polygon, draw_polygon,
-    RobotDetector, draw_robots
+    RobotDetector, draw_robots, create_ball_tracker
 )
 
 
@@ -143,6 +143,13 @@ class ShotDetector:
         self.ball_launch_origins = {}  # obj_id -> (x, y, frame) when upward flight started
         self.ball_prev_positions = {}  # obj_id -> (prev_x, prev_y) for bbox exit detection
         self.scored_ball_ids = set()  # obj_ids that have entered a goal (prevent bounce-out double-counting)
+
+        # Trajectory fitting for robust shot detection
+        traj_cfg = shot_cfg
+        self.trajectory_fit_window = traj_cfg.get("trajectory_fit_window", 8)
+        self.min_trajectory_r_squared = traj_cfg.get("min_trajectory_r_squared", 0.85)
+        self.enable_launch_extrapolation = traj_cfg.get("enable_launch_extrapolation", True)
+        self.enable_goal_prediction = traj_cfg.get("enable_goal_prediction", True)
 
         # Callbacks for real-time streaming (Phase 2)
         self._on_shot_launched = None
@@ -259,30 +266,51 @@ class ShotDetector:
                         obj_id, (obj.cx, obj.cy, frame_num)
                     )
 
+                    # Trajectory fitting for robust shot validation
+                    traj_fit = None
+                    if hasattr(obj, 'trail') and len(obj.trail) >= 4:
+                        traj_fit = self._fit_trajectory(obj.trail)
+
+                    # Launch point extrapolation for better robot attribution
+                    extrap_point = None
+                    if traj_fit and self.enable_launch_extrapolation:
+                        extrap_point = self._extrapolate_launch_point(obj.trail, traj_fit)
+
+                    # Use extrapolated launch point if available and robot detector exists
+                    attr_x = extrap_point[0] if extrap_point else origin_x
+                    attr_y = extrap_point[1] if extrap_point else origin_y
+
                     # Determine robot attribution based on ORIGIN position (not current)
                     robot_name = None
                     should_create_shot = True
+                    attribution_method = "unknown"
+                    robot_candidates = []
 
                     if self.require_bbox_exit and self.robot_detector is not None:
                         # STRICT MODE: Attribution based on where the ball STARTED its flight
-                        # Check if the ball's origin was inside any robot's expanded bbox
+                        # Try extrapolated point first, then original origin
                         inside, origin_robot = self.robot_detector.point_in_robot_bbox(
-                            origin_x, origin_y
+                            attr_x, attr_y
                         )
+                        if not inside and extrap_point:
+                            # Try original origin if extrapolation didn't help
+                            inside, origin_robot = self.robot_detector.point_in_robot_bbox(
+                                origin_x, origin_y
+                            )
                         if inside:
-                            # Ball started inside a robot bbox - attribute to that robot
                             robot_name = origin_robot
+                            attribution_method = "bbox_exit"
                         else:
-                            # Ball didn't start inside any tracked robot
-                            # This could be: untracked robot, human player, or noise
-                            # Check human player zones
-                            robot_name = self._check_hp_zones(origin_x, origin_y)
-                            if robot_name is None:
-                                # Not in HP zone either - attribute to unknown
+                            robot_name = self._check_hp_zones(attr_x, attr_y)
+                            if robot_name is not None:
+                                attribution_method = "hp_zone"
+                            else:
                                 robot_name = "unknown"
+                                attribution_method = "unattributed"
                     else:
                         # RELAXED MODE: Use nearest robot fallback
                         robot_name = self._find_nearest_robot(obj)
+                        attribution_method = "nearest_robot"
 
                     if should_create_shot:
                         # Classify this ball movement (shot vs field_pass vs ignored)
@@ -292,13 +320,22 @@ class ShotDetector:
 
                         # Skip if classified as ignored (slow bounces, ejector dribbles)
                         if classification == "ignored":
-                            # Clean up candidate tracking
                             del self.ball_launch_candidates[obj_id]
                             if obj_id in self.ball_launch_origins:
                                 del self.ball_launch_origins[obj_id]
                             continue
 
-                        # Use origin position for the shot record (where it actually started)
+                        # Get track confidence if available
+                        track_confidence = getattr(obj, 'confidence', None)
+
+                        # Build audit trail
+                        audit = {
+                            "attribution_method": attribution_method,
+                            "track_confidence": track_confidence,
+                            "extrapolated_launch": extrap_point is not None,
+                        }
+
+                        # Use origin position for the shot record
                         shot = ShotEvent(
                             shot_id=len(self.shots),
                             obj_id=obj_id,
@@ -307,6 +344,9 @@ class ShotDetector:
                             launch_frame=origin_frame,
                             robot_name=robot_name,
                             classification=classification,
+                            track_confidence=track_confidence,
+                            trajectory_fit=traj_fit,
+                            audit=audit,
                         )
                         self.shots.append(shot)
                         self.active_shots[obj_id] = shot
@@ -422,6 +462,117 @@ class ShotDetector:
                 return zone.get("name", "human_player")
 
         return None
+
+    def _fit_trajectory(self, trail):
+        """
+        Fit a parabolic trajectory to a sequence of (x, y) positions.
+
+        Fits y = a*t² + b*t + c and x = d*t + e using least squares.
+        A valid shot trajectory has:
+        - Negative initial vertical velocity (b < 0, upward)
+        - Positive curvature (a > 0, parabolic arc — gravity pulls down)
+        - Good R² fit (actually following a parabolic path, not random noise)
+
+        Args:
+            trail: deque or list of (x, y) tuples (most recent last)
+
+        Returns:
+            dict with trajectory fit data, or None if insufficient data:
+            {
+                "a": float,              # quadratic coefficient (curvature)
+                "b": float,              # linear coefficient (initial velocity)
+                "c": float,              # offset
+                "r_squared": float,      # goodness of fit (0-1)
+                "launch_vy": float,      # estimated launch vertical velocity
+                "launch_vx": float,      # estimated launch horizontal velocity
+                "launch_speed": float,   # speed at launch
+                "launch_angle": float,   # angle in degrees from horizontal
+                "predicted_apex_y": float,  # predicted highest point
+            }
+        """
+        positions = list(trail)
+        n = min(len(positions), self.trajectory_fit_window)
+        if n < 4:  # Need at least 4 points for a meaningful parabolic fit
+            return None
+
+        recent = positions[-n:]
+        t = np.arange(n, dtype=np.float64)
+        y_vals = np.array([p[1] for p in recent], dtype=np.float64)
+        x_vals = np.array([p[0] for p in recent], dtype=np.float64)
+
+        # Fit y = a*t² + b*t + c (parabolic trajectory in image coords)
+        try:
+            coeffs = np.polyfit(t, y_vals, 2)
+            a, b, c = coeffs
+
+            # R² for y-axis fit
+            y_pred = np.polyval(coeffs, t)
+            ss_res = np.sum((y_vals - y_pred) ** 2)
+            ss_tot = np.sum((y_vals - np.mean(y_vals)) ** 2)
+            r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+            # Linear fit for x-axis: x = d*t + e
+            x_coeffs = np.polyfit(t, x_vals, 1)
+            launch_vx = float(x_coeffs[0])
+
+            launch_vy = float(b)  # dy/dt at t=0
+            launch_speed = math.sqrt(launch_vx ** 2 + launch_vy ** 2)
+            launch_angle = math.degrees(math.atan2(-launch_vy, abs(launch_vx)))  # Negative vy = upward
+
+            # Predicted apex (where dy/dt = 0): t_apex = -b / (2a)
+            predicted_apex_y = float(c)
+            if a > 0:  # Parabola opens downward in real world (up in image)
+                t_apex = -b / (2 * a)
+                if t_apex > 0:
+                    predicted_apex_y = float(a * t_apex ** 2 + b * t_apex + c)
+
+            return {
+                "a": float(a),
+                "b": float(b),
+                "c": float(c),
+                "r_squared": float(r_squared),
+                "launch_vy": launch_vy,
+                "launch_vx": launch_vx,
+                "launch_speed": launch_speed,
+                "launch_angle": launch_angle,
+                "predicted_apex_y": predicted_apex_y,
+            }
+        except (np.linalg.LinAlgError, ValueError):
+            return None
+
+    def _extrapolate_launch_point(self, trail, traj_fit):
+        """
+        Extrapolate backward along fitted trajectory to estimate launch point.
+
+        This helps when the ball's first detected position was already in flight,
+        outside the robot's bounding box. By extrapolating backward, we can
+        estimate where the ball was when it was actually launched.
+
+        Args:
+            trail: Position history
+            traj_fit: Dict from _fit_trajectory()
+
+        Returns:
+            (x, y) estimated launch point, or None
+        """
+        if traj_fit is None or not self.enable_launch_extrapolation:
+            return None
+
+        positions = list(trail)
+        if len(positions) < 2:
+            return None
+
+        # Extrapolate backward 2-3 frames from the start of the fit window
+        n = min(len(positions), self.trajectory_fit_window)
+        start_x = positions[-n][0]
+        start_y = positions[-n][1]
+
+        # Use fitted velocities to go backward
+        extrap_frames = 3
+        launch_x = start_x - traj_fit["launch_vx"] * extrap_frames
+        launch_y = start_y - traj_fit["launch_vy"] * extrap_frames
+
+        return (launch_x, launch_y)
 
     def _classify_shot(self, launch_x, launch_y, vx, vy, speed):
         """
@@ -596,17 +747,26 @@ class ShotDetector:
         }
 
     def export_csv(self, path="shot_log.csv"):
-        """Export shot log to CSV."""
+        """Export shot log to CSV with enhanced trajectory and audit data."""
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["shot_id", "classification", "robot", "launch_frame", "launch_x",
-                             "launch_y", "result", "result_frame", "goal_name"])
+            writer.writerow([
+                "shot_id", "classification", "robot", "launch_frame", "launch_x",
+                "launch_y", "result", "result_frame", "goal_name",
+                "launch_speed", "launch_angle", "trajectory_r2",
+                "track_confidence", "attribution_method",
+            ])
             for shot in self.shots:
                 writer.writerow([
                     shot.shot_id, shot.classification, shot.robot_name, shot.launch_frame,
                     f"{shot.launch_x:.0f}", f"{shot.launch_y:.0f}",
                     shot.result or "in_flight", shot.result_frame or "",
                     shot.goal_name or "",
+                    f"{shot.launch_speed:.1f}" if shot.launch_speed else "",
+                    f"{shot.launch_angle:.1f}" if shot.launch_angle else "",
+                    f"{shot.trajectory_r_squared:.3f}" if shot.trajectory_r_squared else "",
+                    f"{shot.track_confidence:.2f}" if shot.track_confidence else "",
+                    shot.audit.get("attribution_method", "") if shot.audit else "",
                 ])
         print(f"[CSV] Exported {len(self.shots)} events to {path} "
               f"({sum(1 for s in self.shots if s.classification == 'shot')} shots, "
@@ -630,7 +790,8 @@ class ShotEvent:
     """
 
     def __init__(self, shot_id, obj_id, launch_x, launch_y, launch_frame,
-                 robot_name="unknown", classification="shot"):
+                 robot_name="unknown", classification="shot",
+                 track_confidence=None, trajectory_fit=None, audit=None):
         self.shot_id = shot_id
         self.obj_id = obj_id
         self.launch_x = launch_x
@@ -644,6 +805,16 @@ class ShotEvent:
         self.result_frame = None
         self.goal_name = None
         self.resolved = False
+
+        # Enhanced trajectory data
+        self.track_confidence = track_confidence
+        self.trajectory_fit = trajectory_fit  # dict from _fit_trajectory()
+        self.launch_speed = trajectory_fit["launch_speed"] if trajectory_fit else None
+        self.launch_angle = trajectory_fit["launch_angle"] if trajectory_fit else None
+        self.trajectory_r_squared = trajectory_fit["r_squared"] if trajectory_fit else None
+
+        # Attribution audit trail
+        self.audit = audit or {}
 
     def update_position(self, x, y, frame_num):
         self.positions.append((x, y, frame_num))
@@ -883,12 +1054,7 @@ def main():
     cap, vid_info = open_video(VIDEO_PATH)
     detector = BallDetector(config)
 
-    track_cfg = config["tracking"]
-    tracker = CentroidTracker(
-        max_disappeared=track_cfg["max_frames_missing"],
-        max_distance=track_cfg["max_distance"],
-        trail_length=track_cfg["trail_length"],
-    )
+    tracker = create_ball_tracker(config)
 
     # Optional: dynamic robot tracking
     robot_detector = None
