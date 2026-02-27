@@ -837,3 +837,155 @@ python 10_realtime_pipeline.py video.mkv
 4. Test NVENC encoding (check FFmpeg path, fallback to CPU)
 5. Test live camera input (device 0)
 6. Compare shot counts between batch and stream modes
+
+### Session: 2026-02-27 - OC-SORT Ball Tracker & Enhanced Shot Detection
+
+**Context:**
+The YOLO ball detection model is faster than HSV but the CentroidTracker's greedy centroid-distance matching was causing massive ID swaps and lost tracks in high-density ball scenarios (~500 balls on field, ~100 simultaneously in flight). The game has balls converging on goals in clusters, crossing paths constantly, and being shot at high speed — all failure modes for centroid-only matching with no motion model.
+
+The OCSORTTracker + KalmanBoxTracker already existed for robot tracking (6 objects) but was never applied to balls. This session adapts the OC-SORT architecture for ball tracking at scale.
+
+**Completed:**
+
+1. ✅ **KalmanBallTracker class** (~150 lines in frc_tracker_utils.py)
+   - 6-state Kalman filter: `[cx, cy, r, vx, vy, vr]` (vs 8-state for robots)
+   - Constant-velocity motion model tuned for ball physics
+   - Higher process noise for velocities (balls change direction more than robots)
+   - OC-SORT features: ORU (trajectory smoothing after occlusion), OCM (velocity momentum)
+   - Track confidence scoring (running average of YOLO confidence)
+   - Trail history for trajectory analysis
+
+2. ✅ **OCSORTBallTracker class** (~300 lines in frc_tracker_utils.py)
+   - **Multi-signal cost matrix** (the key improvement over CentroidTracker):
+     - Predicted position distance (weight 0.5) — Kalman-predicted position, not current
+     - Velocity alignment (weight 0.3) — cosine similarity prevents ID swaps at crossings
+     - Size consistency (weight 0.2) — radius ratio prevents wrong-size matches
+   - **Velocity-adaptive gating**: `gate = max(30, speed * 2.5)` per track
+     - Stationary balls: 30px gate (tight)
+     - Fast shots: 150px+ gate (wide enough for high-speed balls)
+   - **Hungarian algorithm** via scipy for globally optimal matching (falls back to greedy)
+   - **Track lifecycle**: TENTATIVE → CONFIRMED → COASTING → DEAD
+     - Only CONFIRMED tracks visible to shot detector (eliminates noise-triggered false shots)
+   - **Dead track re-identification**: revive tracks that reappear near predicted position
+   - **Goal-proximity protection**: tracks near goals get 2x `max_age` before dying
+   - `remove_objects()` for bounce-out prevention (same interface as CentroidTracker)
+   - Detailed stats: matches, unmatched, re-IDs, confirmed/coasting/tentative counts
+
+3. ✅ **_BallTrackerOutputWrapper class** (~100 lines)
+   - Wraps KalmanBallTracker to match TrackedObject interface exactly
+   - All properties: id, cx, cy, radius, area, bbox, vx, vy, speed, is_moving
+   - Trail, disappeared, age, shot_id, robot_id, shot_result
+   - New: confidence, predicted_cx, predicted_cy
+   - get_smoothed_velocity(window) for high-fps noise reduction
+
+4. ✅ **create_ball_tracker() factory function**
+   - `"kalman"` → OCSORTBallTracker (new default)
+   - `"centroid"` → CentroidTracker (legacy fallback)
+   - Config-driven via `ball_tracking.tracker`
+
+5. ✅ **Trajectory-based shot detection** (in 04_zones_and_shots.py)
+   - `_fit_trajectory()`: Parabolic fit (y = at² + bt + c) to last 8 trail positions
+   - R² goodness-of-fit for validation (random noise fails, real trajectories pass)
+   - Computes launch speed, launch angle, predicted apex
+   - `_extrapolate_launch_point()`: Backward trajectory extrapolation for better robot attribution
+   - Enhanced ShotEvent with: track_confidence, launch_speed, launch_angle, trajectory_r², audit trail
+   - Enhanced CSV export with trajectory data and attribution method columns
+
+6. ✅ **TrackingDiagnostics class** (in frc_tracker_utils.py)
+   - Track lifecycle logging: born_frame, died_frame, hit_count, max_speed, shot association
+   - Export to `{video}_track_log.csv`
+   - Summary statistics: avg lifespan, hit rate, shot association count
+   - Integrated into 05_full_pipeline.py Pass 1
+
+7. ✅ **Enhanced HUD**
+   - Tracker quality line: "Tracks: N confirmed | M coasting | P tentative | Re-IDs: X"
+   - Integrated into streaming pipeline HUD stats
+
+8. ✅ **Pipeline integration** (all entry points updated)
+   - `05_full_pipeline.py`: create_ball_tracker(), diagnostics, track log export
+   - `stream_pipeline.py`: create_ball_tracker(), tracker stats in HUD
+   - `03_tracking_sandbox.py`: create_ball_tracker()
+   - `04_zones_and_shots.py`: create_ball_tracker() in interactive mode
+
+**New Config Section:**
+```json
+"ball_tracking": {
+    "tracker": "kalman",
+    "max_distance": 120,
+    "max_age": 15,
+    "min_hits": 3,
+    "trail_length": 30,
+    "base_gate_radius": 30,
+    "gate_factor": 2.5,
+    "match_threshold": 0.8,
+    "cost_weights": {
+        "w_predicted_dist": 0.5,
+        "w_velocity": 0.3,
+        "w_size": 0.2
+    },
+    "enable_reidentification": true,
+    "dead_track_max_age": 30,
+    "goal_proximity_extension": 2.0,
+    "use_oru": true,
+    "use_ocm": true,
+    "process_noise_position": 1.0,
+    "process_noise_velocity": 5.0,
+    "measurement_noise": 2.0
+}
+```
+
+**New Shot Detection Config:**
+```json
+"shot_detection": {
+    "trajectory_fit_window": 8,
+    "min_trajectory_r_squared": 0.85,
+    "enable_launch_extrapolation": true,
+    "enable_goal_prediction": true
+}
+```
+
+**Key Design Decisions:**
+- 6-state Kalman (not 8) because balls are circular — no separate w/h
+- Multi-signal cost matrix with velocity alignment prevents ID swaps at ball crossings
+- Velocity-adaptive gating keeps effective cost matrix small (5-15 candidates, not 100)
+- Track lifecycle states prevent noise from triggering false shots
+- Goal-proximity track protection extends occlusion tolerance where it matters most
+- Trajectory fitting uses numpy polyfit — no new dependencies
+- All changes are backwards compatible: set `ball_tracking.tracker: "centroid"` to revert
+
+**Files Modified:**
+| File | Change |
+|------|--------|
+| `frc_tracker_utils.py` | +KalmanBallTracker, +OCSORTBallTracker, +_BallTrackerOutputWrapper, +create_ball_tracker(), +TrackingDiagnostics, enhanced draw_hud() |
+| `frc_tracker_config.json` | +ball_tracking section, +trajectory shot detection params |
+| `04_zones_and_shots.py` | +_fit_trajectory(), +_extrapolate_launch_point(), enhanced ShotEvent, enhanced CSV export, create_ball_tracker() |
+| `05_full_pipeline.py` | +create_ball_tracker(), +TrackingDiagnostics, +track log export |
+| `stream_pipeline.py` | +create_ball_tracker(), +tracker stats in HUD |
+| `03_tracking_sandbox.py` | +create_ball_tracker() |
+
+**Output Artifacts:**
+- `{video}_annotated.mp4` — annotated video (unchanged)
+- `{video}_annotated_shots.csv` — enhanced with launch_speed, launch_angle, trajectory_r², track_confidence, attribution_method
+- `{video}_annotated_track_log.csv` — **NEW**: full track lifecycle data
+
+**Status:** Implementation complete. Ready for testing.
+
+**Verification Steps:**
+1. Run `03_tracking_sandbox.py` with `ball_tracking.tracker: "kalman"` — verify IDs stable through crossings
+2. Run `05_full_pipeline.py` — compare shot counts with old tracker
+3. Check `_track_log.csv` for tracking quality metrics
+4. Verify HUD shows tracker quality stats in streaming mode
+5. Set `ball_tracking.tracker: "centroid"` to A/B test against legacy tracker
+
+**Tuning Guide:**
+- If IDs swap during crossings: increase `w_velocity` weight
+- If fast balls lose tracking: increase `gate_factor` or `max_distance`
+- If noise creates false tracks: increase `min_hits` (from 3 to 5)
+- If balls lose tracking near goals: increase `goal_proximity_extension`
+- If tracks fragment during brief occlusions: increase `max_age`
+- If dead ball re-ID causes wrong matches: decrease `dead_track_max_age` or disable `enable_reidentification`
+
+**Future Enhancements (planned but not yet implemented):**
+- Phase 4: Hybrid detection (YOLO + HSV cluster refinement)
+- Phase 6: Post-hoc review tool (`11_review_tool.py`)
+- Spatial indexing for O(n log n) matching if needed at extreme ball counts

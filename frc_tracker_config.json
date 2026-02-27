@@ -55,10 +55,34 @@
         "enabled": true
     },
     "tracking": {
-        "_comment": "Multi-object centroid tracker parameters.",
+        "_comment": "Legacy centroid tracker parameters. Used when ball_tracking.tracker = 'centroid'.",
         "max_distance": 80,
         "max_frames_missing": 8,
         "trail_length": 30
+    },
+    "ball_tracking": {
+        "_comment": "OC-SORT ball tracker with Kalman filter. Set tracker to 'kalman' or 'centroid' (legacy).",
+        "tracker": "kalman",
+        "max_distance": 120,
+        "max_age": 15,
+        "min_hits": 3,
+        "trail_length": 30,
+        "base_gate_radius": 30,
+        "gate_factor": 2.5,
+        "match_threshold": 0.8,
+        "cost_weights": {
+            "w_predicted_dist": 0.5,
+            "w_velocity": 0.3,
+            "w_size": 0.2
+        },
+        "enable_reidentification": true,
+        "dead_track_max_age": 30,
+        "goal_proximity_extension": 2.0,
+        "use_oru": true,
+        "use_ocm": true,
+        "process_noise_position": 1.0,
+        "process_noise_velocity": 5.0,
+        "measurement_noise": 2.0
     },
     "motion": {
         "_comment": "Optional motion filtering to separate moving vs stationary balls.",
@@ -145,7 +169,11 @@
         "min_flight_frames": 4,
         "goal_proximity_x": 150,
         "goal_proximity_y": 100,
-        "classify_field_passes": false
+        "classify_field_passes": false,
+        "trajectory_fit_window": 8,
+        "min_trajectory_r_squared": 0.85,
+        "enable_launch_extrapolation": true,
+        "enable_goal_prediction": true
     },
     "human_player_zones": {
         "_comment": "Define human player zones for shot attribution. Supports polygons and rectangles.",

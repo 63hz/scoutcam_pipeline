@@ -40,6 +40,7 @@ from frc_tracker_utils import (
     VideoSource, FileSource, LiveCameraSource,
     NVENCWriter, create_video_writer,
     YOLORobotDetector, RobotDetector,
+    create_ball_tracker,
 )
 
 # Import shot detector
@@ -244,12 +245,7 @@ class TrackStage(PipelineStage):
         self.robot_detector = robot_detector
 
         # Initialize tracker
-        track_cfg = config.get("tracking", {})
-        self.tracker = CentroidTracker(
-            max_disappeared=track_cfg.get("max_frames_missing", 8),
-            max_distance=track_cfg.get("max_distance", 80),
-            trail_length=track_cfg.get("trail_length", 30),
-        )
+        self.tracker = create_ball_tracker(config)
 
         # Initialize shot detector
         # FPS will be set later when we know it
@@ -687,10 +683,14 @@ class RealTimePipeline:
 
             # Add HUD
             shot_stats = self.track_stage.get_shot_stats()
+            tracker_stats = {}
+            if hasattr(self.track_stage.tracker, 'get_stats'):
+                tracker_stats = self.track_stage.tracker.get_stats()
             hud_stats = {
                 "balls_detected": len(state.detections) if state.detections else 0,
                 "balls_tracked": len(state.object_states) if state.object_states else 0,
                 **shot_stats,
+                **tracker_stats,
             }
             info = self.source.get_info()
             frame_count = info.get("frame_count", 0)

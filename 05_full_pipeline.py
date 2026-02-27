@@ -39,7 +39,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from frc_tracker_utils import (
     load_config, open_video, apply_roi,
     BallDetector, CentroidTracker, draw_hud, draw_zones,
-    RobotDetector, YOLORobotDetector, draw_robots
+    RobotDetector, YOLORobotDetector, draw_robots,
+    create_ball_tracker, TrackingDiagnostics
 )
 
 # Import ShotDetector from script 04
@@ -84,12 +85,7 @@ def run_pipeline(video_path, output_path=None):
     print("  PASS 1: Analyzing video...")
     print("=" * 60)
 
-    track_cfg = config["tracking"]
-    tracker = CentroidTracker(
-        max_disappeared=track_cfg["max_frames_missing"],
-        max_distance=track_cfg["max_distance"],
-        trail_length=track_cfg["trail_length"],
-    )
+    tracker = create_ball_tracker(config)
 
     # Optional: dynamic robot tracking (YOLO or HSV)
     robot_detector = None
@@ -111,6 +107,7 @@ def run_pipeline(video_path, output_path=None):
         print("  [ROBOTS] HSV robot tracking enabled")
 
     shot_detector = ShotDetector(config, robot_detector=robot_detector, fps=vid_info["fps"])
+    diagnostics = TrackingDiagnostics()
 
     # Store per-frame data for pass 2
     frame_data = []  # list of {detections, object_states}
@@ -132,6 +129,7 @@ def run_pipeline(video_path, output_path=None):
             robot_detector.detect_and_track(roi_frame)
 
         ids_to_remove = shot_detector.update(objects, frame_num)
+        diagnostics.update(objects, frame_num)
 
         # Remove balls that entered goals (prevents bounce-out double-counting)
         if ids_to_remove:
@@ -180,6 +178,23 @@ def run_pipeline(video_path, output_path=None):
     t_pass1 = time.time() - t_start
     print(f"  Pass 1 complete: {frame_num} frames in {t_pass1:.1f}s "
           f"({frame_num/t_pass1:.0f} fps)")
+
+    # Print tracking quality summary
+    diag_summary = diagnostics.get_summary()
+    print(f"  Tracking: {diag_summary.get('total_tracks', 0)} tracks, "
+          f"avg lifespan {diag_summary.get('avg_lifespan_frames', 0):.0f} frames, "
+          f"avg hit rate {diag_summary.get('avg_hit_rate', 0):.1%}")
+
+    # Export track lifecycle log
+    track_log_path = os.path.splitext(output_video)[0] + "_track_log.csv"
+    diagnostics.export(track_log_path)
+
+    # Print tracker stats if available
+    if hasattr(tracker, 'get_stats'):
+        tstats = tracker.get_stats()
+        print(f"  Tracker stats: {tstats.get('matches', 0)} matches, "
+              f"{tstats.get('reidentifications', 0)} re-IDs, "
+              f"{tstats.get('dead_tracks', 0)} dead tracks")
 
     # Build shot lookup: obj_id -> shot result (with launch_frame for proper tracer coloring)
     # Also build a list for computing live stats during Pass 2
