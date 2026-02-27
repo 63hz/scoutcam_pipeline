@@ -89,9 +89,10 @@ def draw_tracking_frame(frame, tracker_objects, show_trails=True,
                 alpha = i / len(pts)
                 tc = tuple(int(c * (0.3 + 0.7 * alpha)) for c in color)
                 thickness = max(1, int(2 * alpha))
-                pt1 = (int(pts[i-1][0]), int(pts[i-1][1]))
+                pt1 = (int(pts[i-1][0]), int(pts[i-1][1]))  # handles (x,y) or (x,y,frame)
                 pt2 = (int(pts[i][0]), int(pts[i][1]))
                 cv2.line(annotated, pt1, pt2, tc, thickness)
+
 
         # Ball circle
         cv2.circle(annotated, (cx, cy), int(obj.radius), color, 2)
@@ -133,6 +134,15 @@ def main():
 
     tracker = create_ball_tracker(config)
 
+    # Get tracking config for trackbar defaults
+    bt_cfg = config.get("ball_tracking", {})
+    legacy_cfg = config.get("tracking", {})
+    track_cfg = {
+        "max_distance": bt_cfg.get("max_distance", legacy_cfg.get("max_distance", 80)),
+        "max_frames_missing": bt_cfg.get("max_age", legacy_cfg.get("max_frames_missing", 8)),
+        "trail_length": bt_cfg.get("trail_length", legacy_cfg.get("trail_length", 30)),
+    }
+
     # Display toggles
     show_trails = True
     show_velocity = False
@@ -170,10 +180,11 @@ def main():
         new_max_missing = cv2.getTrackbarPos("Max Missing", win_ctrl)
         new_trail_len = cv2.getTrackbarPos("Trail Len", win_ctrl)
 
-        if new_max_dist != tracker.max_distance:
+        if hasattr(tracker, 'max_distance') and new_max_dist != tracker.max_distance:
             tracker.max_distance = max(1, new_max_dist)
-        if new_max_missing != tracker.max_disappeared:
-            tracker.max_disappeared = max(1, new_max_missing)
+        missing_attr = 'max_age' if hasattr(tracker, 'max_age') else 'max_disappeared'
+        if getattr(tracker, missing_attr, None) != new_max_missing:
+            setattr(tracker, missing_attr, max(1, new_max_missing))
         # trail_length can't be changed on existing deques easily,
         # but new objects will use the new length
         tracker.trail_length = max(2, new_trail_len)
@@ -241,7 +252,8 @@ def main():
         moving_count = sum(1 for o in objects.values()
                           if o.disappeared == 0 and o.is_moving)
         max_simultaneous = max(max_simultaneous, active_count)
-        total_ids_created = tracker.next_id
+        stats = tracker.get_stats() if hasattr(tracker, 'get_stats') else {}
+        total_ids_created = stats.get("active_tracks", 0) + stats.get("dead_tracks", 0) if stats else getattr(tracker, 'next_id', 0)
 
         # Draw
         if debug_mode:
@@ -292,9 +304,9 @@ def main():
         elif key == ord('d'):
             debug_mode = not debug_mode
         elif key == ord('s'):
-            config["tracking"]["max_distance"] = tracker.max_distance
-            config["tracking"]["max_frames_missing"] = tracker.max_disappeared
-            config["tracking"]["trail_length"] = tracker.trail_length
+            config["tracking"]["max_distance"] = getattr(tracker, 'max_distance', 80)
+            config["tracking"]["max_frames_missing"] = getattr(tracker, 'max_disappeared', getattr(tracker, 'max_age', 8))
+            config["tracking"]["trail_length"] = getattr(tracker, 'trail_length', 30)
             save_config(config)
         elif key == ord('+') or key == ord('='):
             playback_delay = max(1, playback_delay - 5)
@@ -311,9 +323,9 @@ def main():
     print(f"  Total unique IDs assigned: {total_ids_created}")
     print(f"  Max simultaneous tracked:  {max_simultaneous}")
     print(f"  Tracker settings:")
-    print(f"    max_distance:      {tracker.max_distance}")
-    print(f"    max_disappeared:   {tracker.max_disappeared}")
-    print(f"    trail_length:      {tracker.trail_length}")
+    print(f"    max_distance:      {getattr(tracker, 'max_distance', 'N/A')}")
+    print(f"    max_age:           {getattr(tracker, 'max_age', getattr(tracker, 'max_disappeared', 'N/A'))}")
+    print(f"    trail_length:      {getattr(tracker, 'trail_length', 'N/A')}")
     print("=" * 50)
 
 

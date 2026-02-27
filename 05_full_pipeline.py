@@ -142,7 +142,7 @@ def run_pipeline(video_path, output_path=None):
                 obj_states[oid] = {
                     "cx": obj.cx, "cy": obj.cy,
                     "radius": obj.radius,
-                    "trail": list(obj.trail),
+                    "trail": [(pt[0], pt[1], frame_num) for pt in obj.trail],
                     "is_moving": obj.is_moving,
                     "vx": obj.vx, "vy": obj.vy,
                     "speed": obj.speed,
@@ -186,7 +186,7 @@ def run_pipeline(video_path, output_path=None):
           f"avg hit rate {diag_summary.get('avg_hit_rate', 0):.1%}")
 
     # Export track lifecycle log
-    track_log_path = os.path.splitext(output_video)[0] + "_track_log.csv"
+    track_log_path = os.path.splitext(output_path)[0] + "_track_log.csv"
     diagnostics.export(track_log_path)
 
     # Print tracker stats if available
@@ -383,6 +383,11 @@ def run_pipeline(video_path, output_path=None):
             trail = state["trail"]
             if len(trail) > 1:
                 for i in range(1, len(trail)):
+                    # Skip pre-launch trail segments for shot-colored balls
+                    if is_tracked_event and launch_frame is not None:
+                        seg_frame = trail[i][2] if len(trail[i]) > 2 else None
+                        if seg_frame is not None and seg_frame < launch_frame:
+                            continue
                     alpha = i / len(trail)
                     tc = tuple(int(c * alpha) for c in color)
                     pt1 = (int(trail[i-1][0]), int(trail[i-1][1]))

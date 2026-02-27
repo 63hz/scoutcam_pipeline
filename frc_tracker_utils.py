@@ -4458,6 +4458,325 @@ class TrackingDiagnostics:
 
 
 # ============================================================================
+# DIAGNOSTIC RUNNER (headless quality evaluation)
+# ============================================================================
+
+class DiagnosticRunner:
+    """
+    Headless processing loop for evaluating tracking/detection/shot quality.
+
+    Runs detection -> tracking -> (optional) shot detection on a frame range
+    and collects structured metrics. No GUI (cv2.imshow) — safe for CLI use.
+
+    Usage:
+        runner = DiagnosticRunner(config, "video.mkv")
+        results = runner.run(start_frame=0, end_frame=500)
+        print(json.dumps(results, indent=2))
+    """
+
+    def __init__(self, config, video_path, label=None,
+                 enable_shots=True, enable_robots=True):
+        self.config = config
+        self.video_path = str(video_path)
+        self.label = label or "default"
+        self.enable_shots = enable_shots
+        self.enable_robots = enable_robots
+        self._timeseries = []
+
+    def run(self, start_frame=0, end_frame=None, quiet=False):
+        """
+        Process frames and return structured metrics dict.
+
+        Args:
+            start_frame: First frame to process (default 0)
+            end_frame: Last frame to process (default: all)
+            quiet: Suppress stderr progress output
+
+        Returns:
+            dict: Structured metrics (JSON-serializable)
+        """
+        import sys as _sys
+
+        cap, vid_info = open_video(self.video_path)
+        fps = vid_info["fps"]
+        total_video_frames = vid_info["frame_count"]
+        if end_frame is None or end_frame > total_video_frames:
+            end_frame = total_video_frames
+
+        if start_frame > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        detector = BallDetector(self.config)
+        tracker = create_ball_tracker(self.config)
+        diagnostics = TrackingDiagnostics()
+
+        # Determine tracker type for reporting
+        ball_cfg = self.config.get("ball_tracking", {})
+        tracker_type = ball_cfg.get("tracker", "centroid")
+
+        # Optional robot detector
+        robot_detector = None
+        if self.enable_robots:
+            yolo_cfg = self.config.get("yolo_robot_detection", {})
+            hsv_cfg = self.config.get("robot_detection", {})
+            if yolo_cfg.get("enabled", False):
+                try:
+                    robot_detector = YOLORobotDetector(self.config)
+                except (ImportError, FileNotFoundError):
+                    if hsv_cfg.get("enabled", False):
+                        robot_detector = RobotDetector(self.config)
+            elif hsv_cfg.get("enabled", False):
+                robot_detector = RobotDetector(self.config)
+
+        # Optional shot detector (imported dynamically to avoid circular import)
+        shot_detector = None
+        if self.enable_shots:
+            try:
+                import importlib.util
+                _spec = importlib.util.spec_from_file_location(
+                    "zones_and_shots",
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "04_zones_and_shots.py")
+                )
+                _mod = importlib.util.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                shot_detector = _mod.ShotDetector(
+                    self.config, robot_detector=robot_detector, fps=fps)
+            except Exception as e:
+                if not quiet:
+                    print(f"[DIAG] Shot detection disabled: {e}",
+                          file=_sys.stderr)
+
+        # Per-frame collection
+        self._timeseries = []
+        all_velocities = []
+        all_areas = []
+        detection_counts = []
+        prev_next_id = 0
+        simultaneous_peak = 0
+
+        t_start = time.time()
+        frames_processed = 0
+
+        for frame_num in range(start_frame, end_frame):
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            roi_frame = apply_roi(frame, self.config["roi"])
+            detections = detector.detect(roi_frame)
+            objects = tracker.update(detections)
+
+            if robot_detector is not None:
+                robot_detector.detect_and_track(roi_frame)
+
+            ids_to_remove = []
+            if shot_detector is not None:
+                ids_to_remove = shot_detector.update(objects, frame_num)
+
+            diagnostics.update(objects, frame_num)
+
+            if ids_to_remove:
+                tracker.remove_objects(ids_to_remove)
+
+            # Count new IDs created this frame
+            if hasattr(tracker, 'get_stats'):
+                stats = tracker.get_stats()
+                new_ids = stats.get("tentative", 0)  # approximate
+            else:
+                # CentroidTracker: use next_id delta
+                new_ids = tracker.next_id - prev_next_id
+                prev_next_id = tracker.next_id
+
+            # Collect per-frame metrics
+            n_detected = len(detections)
+            n_tracked = sum(1 for o in objects.values()
+                           if o.disappeared == 0)
+            detection_counts.append(n_detected)
+            simultaneous_peak = max(simultaneous_peak, n_tracked)
+
+            frame_velocities = []
+            for obj in objects.values():
+                if obj.disappeared == 0:
+                    spd = obj.speed if hasattr(obj, 'speed') else 0.0
+                    frame_velocities.append(spd)
+                    all_velocities.append(spd)
+
+            for det in detections:
+                all_areas.append(det.get("area", 0))
+
+            self._timeseries.append({
+                "frame": frame_num,
+                "detections": n_detected,
+                "tracked": n_tracked,
+                "new_ids": new_ids,
+                "velocity_median": float(np.median(frame_velocities))
+                if frame_velocities else 0.0,
+            })
+
+            frames_processed += 1
+            if not quiet and frames_processed % 200 == 0:
+                elapsed = time.time() - t_start
+                proc_fps = frames_processed / elapsed if elapsed > 0 else 0
+                pct = frames_processed / (end_frame - start_frame) * 100
+                print(f"\r[DIAG] {pct:.0f}% ({frames_processed} frames, "
+                      f"{proc_fps:.0f} fps)", end="", file=_sys.stderr)
+
+        elapsed = time.time() - t_start
+        processing_fps = frames_processed / elapsed if elapsed > 0 else 0
+        cap.release()
+
+        if not quiet:
+            print(f"\r[DIAG] Done: {frames_processed} frames in "
+                  f"{elapsed:.1f}s ({processing_fps:.0f} fps)",
+                  file=_sys.stderr)
+
+        # Build results
+        diag_summary = diagnostics.get_summary()
+        all_records = (diagnostics._completed_records
+                       + list(diagnostics._track_records.values()))
+
+        # Track lifespan analysis
+        lifespans = [r["total_frames"] for r in all_records] if all_records else [0]
+        short_lived = sum(1 for l in lifespans if l <= 3)
+        short_lived_pct = (short_lived / len(lifespans) * 100) if lifespans else 0
+
+        total_ids = diag_summary.get("total_tracks", 0)
+        id_creation_rate = (total_ids / frames_processed
+                            if frames_processed > 0 else 0)
+        avg_lifespan = diag_summary.get("avg_lifespan_frames", 0)
+        match_rate = diag_summary.get("avg_hit_rate", 0)
+
+        # Velocity percentiles
+        vel_arr = np.array(all_velocities) if all_velocities else np.array([0.0])
+        vel_p50 = float(np.percentile(vel_arr, 50))
+        vel_p95 = float(np.percentile(vel_arr, 95))
+        vel_p99 = float(np.percentile(vel_arr, 99))
+        implausible_pct = (float(np.mean(vel_arr > 150)) * 100
+                           if len(vel_arr) > 0 else 0)
+
+        # Detection stats
+        det_arr = np.array(detection_counts) if detection_counts else np.array([0])
+        area_arr = np.array(all_areas) if all_areas else np.array([0.0])
+
+        # Config snapshot for reproducibility
+        tracking_cfg = self.config.get("tracking", {})
+        config_snapshot = {
+            "ball_tracking.tracker": tracker_type,
+            "tracking.max_distance": tracking_cfg.get("max_distance", 80),
+            "tracking.max_frames_missing": tracking_cfg.get(
+                "max_frames_missing", 8),
+        }
+        if tracker_type == "kalman":
+            config_snapshot.update({
+                "ball_tracking.max_distance": ball_cfg.get("max_distance", 120),
+                "ball_tracking.max_age": ball_cfg.get("max_age", 15),
+                "ball_tracking.min_hits": ball_cfg.get("min_hits", 3),
+            })
+
+        results = {
+            "run_info": {
+                "label": self.label,
+                "video": os.path.basename(self.video_path),
+                "fps": round(fps, 2),
+                "frames_processed": frames_processed,
+                "frame_range": [start_frame, start_frame + frames_processed],
+                "processing_fps": round(processing_fps, 1),
+                "tracker_type": tracker_type,
+                "config_snapshot": config_snapshot,
+            },
+            "detection": {
+                "per_frame_mean": round(float(np.mean(det_arr)), 1),
+                "per_frame_std": round(float(np.std(det_arr)), 1),
+                "per_frame_p50": int(np.percentile(det_arr, 50)),
+                "per_frame_p95": int(np.percentile(det_arr, 95)),
+                "area_mean": round(float(np.mean(area_arr)), 1),
+                "area_std": round(float(np.std(area_arr)), 1),
+                "total": int(np.sum(det_arr)),
+            },
+            "tracking": {
+                "total_ids_created": total_ids,
+                "id_creation_rate": round(id_creation_rate, 2),
+                "avg_track_lifespan": round(avg_lifespan, 1),
+                "short_lived_tracks_pct": round(short_lived_pct, 1),
+                "match_rate": round(match_rate, 2),
+                "simultaneous_peak": simultaneous_peak,
+                "velocity_p50": round(vel_p50, 1),
+                "velocity_p95": round(vel_p95, 1),
+                "velocity_p99": round(vel_p99, 1),
+                "implausible_velocity_pct": round(implausible_pct, 1),
+            },
+        }
+
+        # Shot stats (optional)
+        if shot_detector is not None:
+            shot_stats = shot_detector.get_stats()
+            results["shots"] = {
+                "total": shot_stats.get("shots_total", 0),
+                "scored": shot_stats.get("shots_scored", 0),
+                "missed": shot_stats.get("shots_missed", 0),
+                "attribution_rate": round(
+                    sum(1 for s in shot_detector.shots
+                        if s.robot_name != "unknown")
+                    / max(len(shot_detector.shots), 1), 2),
+                "field_passes": shot_stats.get("field_passes", 0),
+            }
+        else:
+            results["shots"] = None
+
+        # Health assessment
+        results["health"] = self._assess_health(results["tracking"])
+        return results
+
+    def get_timeseries(self):
+        """Return per-frame metrics list (call after run())."""
+        return self._timeseries
+
+    @staticmethod
+    def _assess_health(tracking):
+        """Assess tracking health and return pass/fail with issues."""
+        issues = []
+        icr = tracking["id_creation_rate"]
+        slp = tracking["short_lived_tracks_pct"]
+        mr = tracking["match_rate"]
+        vp99 = tracking["velocity_p99"]
+        als = tracking["avg_track_lifespan"]
+
+        if icr > 2.0:
+            issues.append(f"id_creation_rate {icr} > 2.0 threshold "
+                          f"(excessive ID churn)")
+        elif icr > 1.0:
+            issues.append(f"id_creation_rate {icr} in warning range 1.0-2.0")
+
+        if slp > 40:
+            issues.append(f"short_lived_tracks {slp}% > 40% threshold")
+        elif slp > 20:
+            issues.append(f"short_lived_tracks {slp}% in warning range 20-40%")
+
+        if mr < 0.60:
+            issues.append(f"match_rate {mr} < 0.60 threshold (poor matching)")
+        elif mr < 0.80:
+            issues.append(f"match_rate {mr} in warning range 0.60-0.80")
+
+        if vp99 > 150:
+            issues.append(f"velocity_p99 {vp99} > 150 threshold "
+                          f"(implausible velocities)")
+        elif vp99 > 80:
+            issues.append(f"velocity_p99 {vp99} in warning range 80-150")
+
+        if als < 4:
+            issues.append(f"avg_track_lifespan {als} < 4 threshold "
+                          f"(tracks dying too fast)")
+        elif als < 8:
+            issues.append(f"avg_track_lifespan {als} in warning range 4-8")
+
+        # tracking_ok = no "broken" level issues (only warnings or clean)
+        broken = (icr > 2.0 or slp > 40 or mr < 0.60
+                  or vp99 > 150 or als < 4)
+        return {"tracking_ok": not broken, "issues": issues}
+
+
+# ============================================================================
 # HUD OVERLAY
 # ============================================================================
 

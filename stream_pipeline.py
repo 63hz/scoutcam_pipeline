@@ -291,7 +291,7 @@ class TrackStage(PipelineStage):
                 state.object_states[oid] = {
                     "cx": obj.cx, "cy": obj.cy,
                     "radius": obj.radius,
-                    "trail": list(obj.trail),
+                    "trail": [(pt[0], pt[1], state.frame_num) for pt in obj.trail],
                     "is_moving": obj.is_moving,
                     "vx": obj.vx, "vy": obj.vy,
                     "shot_id": getattr(obj, "shot_id", None),
@@ -425,10 +425,16 @@ class RenderStage(PipelineStage):
                 else:
                     color = (60, 60, 60)  # Gray
 
-                # Draw trail
+                # Draw trail - skip pre-launch segments for shots
                 trail = obj["trail"]
+                launch_frame = shot_info.get("launch_frame") if shot_info else None
                 if len(trail) > 1:
                     for i in range(1, len(trail)):
+                        # Skip pre-launch trail segments for shot-colored balls
+                        if is_shot and launch_frame is not None:
+                            seg_frame = trail[i][2] if len(trail[i]) > 2 else None
+                            if seg_frame is not None and seg_frame < launch_frame:
+                                continue
                         alpha = i / len(trail)
                         tc = tuple(int(c * alpha) for c in color)
                         pt1 = (int(trail[i-1][0]), int(trail[i-1][1]))
